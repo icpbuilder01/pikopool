@@ -12,14 +12,14 @@ get_or_create() {
   icp canister create "$1" -q 2>/dev/null || icp canister status "$1" -i
 }
 
-echo "==> Starting local ICP network..."
-icp network start -d
-
 echo "==> Writing placeholder ledger init args so the project can load..."
 PLACEHOLDER="2vxsx-fae" # anonymous principal, syntactically valid placeholder
 sed "s/__DEPLOYER_PRINCIPAL__/$PLACEHOLDER/" test-icp-ledger/icrc1_ledger_init.args.template > test-icp-ledger/icrc1_ledger_init.args
 sed -e "s/__TEST_MOTHER_PRINCIPAL__/$PLACEHOLDER/" -e "s/__DEPLOYER_PRINCIPAL__/$PLACEHOLDER/" \
   test-piko-ledger/icrc1_ledger_init.args.template > test-piko-ledger/icrc1_ledger_init.args
+
+echo "==> Starting local ICP network..."
+icp network start -d
 
 echo "==> Creating test-mother to reserve its principal..."
 TEST_MOTHER_ID=$(get_or_create test-mother)

@@ -132,9 +132,20 @@ actor self {
   };
 
   // ---- Share bookkeeping ----
-  transient let currentRoundShares = Map.empty<Principal, Nat>();
-  transient let pendingPoolRewards = Map.empty<Principal, Nat>();
-  transient let lastShareAttempt = Map.empty<Principal, Int>();
+  // currentRoundShares/pendingPoolRewards are real, specific value owed to
+  // specific participants -- must be persisted (plain `let`), NOT
+  // transient. Mirrors mother.mo's own pendingRewards, whose comment spells
+  // out exactly this mistake ("as an earlier version of this file did")
+  // and why it matters: `transient` here would silently zero every
+  // participant's owed PIKO on the canister's very first upgrade. Found
+  // the hard way during local testing (2026-09-18) before this ever went
+  // near mainnet -- see PIKO_LEDGER_FEE's comment below for the other real
+  // bug found in the same session.
+  let currentRoundShares : Map.Map<Principal, Nat> = Map.empty<Principal, Nat>();
+  let pendingPoolRewards : Map.Map<Principal, Nat> = Map.empty<Principal, Nat>();
+  // Just an anti-spam rate-limit cache, safe to lose on upgrade -- same
+  // reasoning as mother's own transient lastAttempt map.
+  transient let lastShareAttempt : Map.Map<Principal, Int> = Map.empty<Principal, Int>();
   let MIN_SHARE_INTERVAL_NANOS : Int = 300_000_000; // 0.3s, same anti-spam reasoning as mother's own MIN_SUBMIT_INTERVAL_NANOS
 
   var blocksWon : Nat = 0;
@@ -265,6 +276,18 @@ actor self {
     #Ok({ accepted = true; isBlockWinner = true; poolSubmitResult = ?result });
   };
 
+  // Same standard ICRC-1 fee the rest of the PIKO family already documents
+  // to users (e.g. PikoPoker's wallet: "Transfers use the standard ICRC-1
+  // ledger fee (0.0001 PIKO)"). Must come out of what the claimant
+  // receives, not out of pikopool's own balance -- otherwise the sum of
+  // every pendingPoolRewards entry (which exactly equals total distributed
+  // rewards, see distributeRoundReward) would exceed pikopool's real
+  // balance by one fee per claim ever made, and whichever claim happens
+  // to run last would fail with InsufficientFunds. Found exactly this way
+  // during local testing (2026-09-18): a real, load-bearing bug, not a
+  // hypothetical -- same class as the PikoLock ledger-fee-shortfall bug.
+  let PIKO_LEDGER_FEE : Nat = 10_000;
+
   public shared ({ caller }) func claimPoolReward() : async Types.TransferResult {
     if (Principal.isAnonymous(caller)) {
       return #Err(#GenericError({ error_code = 0; message = "anonymous caller" }));
@@ -273,20 +296,21 @@ actor self {
       case (?v) v;
       case null 0;
     };
-    if (owed == 0) {
-      return #Err(#GenericError({ error_code = 0; message = "nothing to claim" }));
+    if (owed <= PIKO_LEDGER_FEE) {
+      return #Err(#GenericError({ error_code = 0; message = "nothing to claim, or pending reward is too small to cover the network fee" }));
     };
     // Clear before awaiting -- prevents a double-claim race, same pattern
     // as mother's claimPendingReward / pikopoker's claimPendingPayout.
     Map.add(pendingPoolRewards, Principal.compare, caller, 0);
 
+    let payout = owed - PIKO_LEDGER_FEE : Nat;
     let PikoLedger : Types.LedgerActor = actor (Principal.toText(pikoLedgerId));
     let outcome = try {
       ?(
         await PikoLedger.icrc1_transfer({
           from_subaccount = null;
           to = { owner = caller; subaccount = null };
-          amount = owed;
+          amount = payout;
           fee = null;
           memo = null;
           created_at_time = null;
