@@ -164,6 +164,21 @@ actor self {
   transient let lastShareAttempt : Map.Map<Principal, Int> = Map.empty<Principal, Int>();
   let MIN_SHARE_INTERVAL_NANOS : Int = 300_000_000; // 0.3s, same anti-spam reasoning as mother's own MIN_SUBMIT_INTERVAL_NANOS
 
+  // Presence tracking, entirely separate from share credit -- a share only
+  // arrives when someone gets lucky against shareDifficultyBits (a Poisson
+  // process, rare enough that "distinct principals credited a share since
+  // the last win" can't answer "who's mining right now"). The client pings
+  // this on a fixed cadence while actively mining, independent of whether
+  // any given search attempt happens to clear a share. Just a liveness
+  // signal, safe to lose on upgrade -- same class as lastShareAttempt.
+  transient let lastSeenAt : Map.Map<Principal, Int> = Map.empty<Principal, Int>();
+  let ACTIVE_WINDOW_NANOS : Int = 60_000_000_000; // 60s -- comfortably above the client's own heartbeat interval
+
+  public shared ({ caller }) func heartbeat() : async () {
+    if (Principal.isAnonymous(caller)) { return };
+    Map.add(lastSeenAt, Principal.compare, caller, Time.now());
+  };
+
   // Fixed for the ICP ledger's whole history, same constant mother/
   // PikoNativeMiner both hardcode. Real cost of THIS canister's own
   // ICP balance per won block is `miningFeeE8s + this fee` -- mother's own
@@ -455,7 +470,12 @@ actor self {
     // noisy no matter how it's averaged when the real share rate is low
     // (a lone or small pool). Resets with the rest of the round on a win.
     let activeMinersThisRound = Map.size(currentRoundShares);
-    { blocksWon; totalSharesAllTime; totalPikoDistributed; currentRoundTotalShares; activeMinersThisRound };
+    let now = Time.now();
+    var activeMinersNow = 0;
+    for ((_, seenAt) in Map.entries(lastSeenAt)) {
+      if (now - seenAt < ACTIVE_WINDOW_NANOS) { activeMinersNow += 1 };
+    };
+    { blocksWon; totalSharesAllTime; totalPikoDistributed; currentRoundTotalShares; activeMinersThisRound; activeMinersNow };
   };
 
   public shared query ({ caller }) func getMyShare() : async { sharesThisRound : Nat; pendingReward : Nat } {

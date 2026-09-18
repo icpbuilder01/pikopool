@@ -72,6 +72,7 @@ type ShareError =
  };
 type PoolStats =
  record {
+   activeMinersNow: nat;
    activeMinersThisRound: nat;
    blocksWon: nat;
    currentRoundTotalShares: nat;
@@ -106,6 +107,7 @@ type ApproveError =
  };
 service : {
   claimPoolReward: () -> (TransferResult);
+  heartbeat: () -> ();
   getMyShare: () -> (record {
                        pendingReward: nat;
                        sharesThisRound: nat;
