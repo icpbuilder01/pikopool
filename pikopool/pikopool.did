@@ -70,8 +70,9 @@ type ShareError =
    StaleWork;
    TooSoon: record {retryAfterNanos: nat;};
  };
-type PoolStats = 
+type PoolStats =
  record {
+   activeMinersThisRound: nat;
    blocksWon: nat;
    currentRoundTotalShares: nat;
    totalPikoDistributed: nat;

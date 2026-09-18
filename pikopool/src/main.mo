@@ -449,7 +449,13 @@ actor self {
   public query func getPoolStats() : async Types.PoolStats {
     var currentRoundTotalShares = 0;
     for ((_, c) in Map.entries(currentRoundShares)) { currentRoundTotalShares += c };
-    { blocksWon; totalSharesAllTime; totalPikoDistributed; currentRoundTotalShares };
+    // Distinct principals credited at least one share since the last win --
+    // a much steadier, more legible number for the UI than a hashrate
+    // ESTIMATE derived from Poisson-distributed share timing, which stays
+    // noisy no matter how it's averaged when the real share rate is low
+    // (a lone or small pool). Resets with the rest of the round on a win.
+    let activeMinersThisRound = Map.size(currentRoundShares);
+    { blocksWon; totalSharesAllTime; totalPikoDistributed; currentRoundTotalShares; activeMinersThisRound };
   };
 
   public shared query ({ caller }) func getMyShare() : async { sharesThisRound : Nat; pendingReward : Nat } {

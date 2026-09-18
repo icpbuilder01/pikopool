@@ -141,5 +141,6 @@ module {
     totalSharesAllTime : Nat;
     totalPikoDistributed : Nat;
     currentRoundTotalShares : Nat;
+    activeMinersThisRound : Nat;
   };
 }
