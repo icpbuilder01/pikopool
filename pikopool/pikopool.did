@@ -62,10 +62,11 @@ type ShareOutcome =
    isBlockWinner: bool;
    poolSubmitResult: opt SubmitResult;
  };
-type ShareError = 
+type ShareError =
  variant {
    Anonymous;
    BelowShareTarget;
+   DuplicateNonce;
    StaleWork;
    TooSoon: record {retryAfterNanos: nat;};
  };

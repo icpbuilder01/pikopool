@@ -125,6 +125,7 @@ module {
     #TooSoon : { retryAfterNanos : Nat };
     #StaleWork; // height doesn't match the pool's current cached job
     #BelowShareTarget; // hash didn't even clear the (easier) share difficulty
+    #DuplicateNonce; // this exact nonce was already credited this round
   };
 
   public type ShareResult = { #Ok : ShareOutcome; #Err : ShareError };

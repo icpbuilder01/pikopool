@@ -1,6 +1,7 @@
 import Principal "mo:core/Principal";
 import Int "mo:core/Int";
 import Blob "mo:core/Blob";
+import Nat "mo:core/Nat";
 import Nat8 "mo:core/Nat8";
 import Nat64 "mo:core/Nat64";
 import Array "mo:core/Array";
@@ -144,6 +145,20 @@ actor self {
   // bug found in the same session.
   let currentRoundShares : Map.Map<Principal, Nat> = Map.empty<Principal, Nat>();
   let pendingPoolRewards : Map.Map<Principal, Nat> = Map.empty<Principal, Nat>();
+  // Every nonce ever credited this round, regardless of who submitted it --
+  // NOT scoped per-caller, since the hash only depends on
+  // (previousHash, height, nonce), never on the caller: two different
+  // principals submitting the identical nonce would otherwise both get
+  // credited for the exact same one-time proof of work. Without this,
+  // resubmitting one already-credited nonce every MIN_SHARE_INTERVAL_NANOS
+  // for the rest of the round manufactures unlimited share credit for zero
+  // additional work -- confirmed live during a 2026-09-18 post-crash
+  // re-verification session (one real share replayed 5x -> 6 credited
+  // shares from a single hash computation). Persisted (plain `let`), same
+  // reasoning as currentRoundShares/pendingPoolRewards above, and cleared
+  // alongside currentRoundShares at the end of each round in
+  // distributeRoundReward.
+  let usedNoncesThisRound : Map.Map<Nat, ()> = Map.empty<Nat, ()>();
   // Just an anti-spam rate-limit cache, safe to lose on upgrade -- same
   // reasoning as mother's own transient lastAttempt map.
   transient let lastShareAttempt : Map.Map<Principal, Int> = Map.empty<Principal, Int>();
@@ -207,9 +222,11 @@ actor self {
     if (total == 0) { return }; // shouldn't happen -- this only runs right after crediting a share this round
 
     // Snapshot now, before any awaits below -- submitShare calls that land
-    // concurrently during fee collection add to currentRoundShares for the
-    // NEXT round and must not be touched by this round's payout or cleanup.
+    // concurrently during fee collection add to currentRoundShares (and
+    // usedNoncesThisRound) for the NEXT round and must not be touched by
+    // this round's payout or cleanup.
     let entries = Iter.toArray(Map.entries(currentRoundShares));
+    let usedNonceKeysThisRound = Iter.toArray(Map.keys(usedNoncesThisRound));
     let IcpLedger : Types.LedgerActor = actor (Principal.toText(icpLedgerId));
 
     var distributed = 0;
@@ -268,10 +285,13 @@ actor self {
       };
     };
     // Remove only this round's own snapshot -- NOT Map.clear, which would
-    // also wipe any new shares that arrived (for the next round) during
-    // this function's awaits above.
+    // also wipe any new shares (or nonces) that arrived (for the next
+    // round) during this function's awaits above.
     for ((p, _) in entries.vals()) {
       Map.remove(currentRoundShares, Principal.compare, p);
+    };
+    for (n in usedNonceKeysThisRound.vals()) {
+      Map.remove(usedNoncesThisRound, Nat.compare, n);
     };
   };
 
@@ -295,6 +315,16 @@ actor self {
     let candidateHash = computeHash(cachedWork.previousHash, height, nonce);
     let zeroBits = leadingZeroBits(candidateHash);
     if (zeroBits < shareDifficultyBits) { return #Err(#BelowShareTarget) };
+
+    // Reject a nonce already credited this round, to anyone -- the hash
+    // only depends on (previousHash, height, nonce), never on the caller,
+    // so without this check the exact same one-time proof of work could be
+    // resubmitted (by the same caller, or copied by a different one) for
+    // unlimited extra share credit. See usedNoncesThisRound's own comment.
+    if (Map.containsKey(usedNoncesThisRound, Nat.compare, nonce)) {
+      return #Err(#DuplicateNonce);
+    };
+    Map.add(usedNoncesThisRound, Nat.compare, nonce, ());
 
     // Valid share -- credit it now, regardless of what happens below.
     let prevCount = switch (Map.get(currentRoundShares, Principal.compare, caller)) {
