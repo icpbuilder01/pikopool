@@ -51,10 +51,35 @@ module {
 
   public type ApproveResult = { #Ok : Nat; #Err : ApproveError };
 
+  public type TransferFromArgs = {
+    spender_subaccount : ?Blob;
+    from : Account;
+    to : Account;
+    amount : Nat;
+    fee : ?Nat;
+    memo : ?Blob;
+    created_at_time : ?Nat64;
+  };
+
+  public type TransferFromError = {
+    #BadFee : { expected_fee : Nat };
+    #BadBurn : { min_burn_amount : Nat };
+    #InsufficientFunds : { balance : Nat };
+    #InsufficientAllowance : { allowance : Nat };
+    #TooOld;
+    #CreatedInFuture : { ledger_time : Nat64 };
+    #Duplicate : { duplicate_of : Nat };
+    #TemporarilyUnavailable;
+    #GenericError : { error_code : Nat; message : Text };
+  };
+
+  public type TransferFromResult = { #Ok : Nat; #Err : TransferFromError };
+
   public type LedgerActor = actor {
     icrc1_transfer : (TransferArg) -> async TransferResult;
     icrc1_balance_of : (Account) -> async Nat;
     icrc2_approve : (ApproveArgs) -> async ApproveResult;
+    icrc2_transfer_from : (TransferFromArgs) -> async TransferFromResult;
   };
 
   // Mirrors mother/src/types.mo's Work/SubmitOk/SubmitError/SubmitResult
@@ -76,17 +101,7 @@ module {
     #InvalidProof;
     #TooSoon : { retryAfterNanos : Nat };
     #NothingToClaim;
-    #IcpFeeFailed : {
-      #BadFee : { expected_fee : Nat };
-      #BadBurn : { min_burn_amount : Nat };
-      #InsufficientFunds : { balance : Nat };
-      #InsufficientAllowance : { allowance : Nat };
-      #TooOld;
-      #CreatedInFuture : { ledger_time : Nat64 };
-      #Duplicate : { duplicate_of : Nat };
-      #TemporarilyUnavailable;
-      #GenericError : { error_code : Nat; message : Text };
-    };
+    #IcpFeeFailed : TransferFromError;
     #StaleWork;
   };
 

@@ -8,6 +8,7 @@ import Time "mo:core/Time";
 import Runtime "mo:core/Runtime";
 import Timer "mo:core/Timer";
 import Map "mo:core/Map";
+import Iter "mo:core/Iter";
 import Sha256 "mo:sha2/Sha256";
 import Types "types";
 
@@ -148,6 +149,15 @@ actor self {
   transient let lastShareAttempt : Map.Map<Principal, Int> = Map.empty<Principal, Int>();
   let MIN_SHARE_INTERVAL_NANOS : Int = 300_000_000; // 0.3s, same anti-spam reasoning as mother's own MIN_SUBMIT_INTERVAL_NANOS
 
+  // Fixed for the ICP ledger's whole history, same constant mother/
+  // PikoNativeMiner both hardcode. Real cost of THIS canister's own
+  // ICP balance per won block is `miningFeeE8s + this fee` -- mother's own
+  // icrc2_transfer_from pull (see submitProof there) debits its `from`
+  // (this canister) for `amount + fee`, not just `amount`. Must be folded
+  // into what's collected from participants below, or the pool leaks
+  // exactly this much on every single block forever, however small.
+  let ICP_LEDGER_FEE_E8S : Nat = 10_000;
+
   var blocksWon : Nat = 0;
   var totalSharesAllTime : Nat = 0;
   var totalPikoDistributed : Nat = 0;
@@ -177,26 +187,73 @@ actor self {
     Sha256.fromArray(#sha256, Array.concat(Array.concat(Blob.toArray(prev), natToBytes8(atHeight)), natToBytes8(nonce)));
   };
 
-  func distributeRoundReward(reward : Nat) {
+  // Collects each participant's proportional share of the ICP mining fee
+  // this canister just advanced to mother, THEN credits their PIKO reward
+  // -- no successful collection, no reward, full stop. This is the entire
+  // sustainability mechanism: without it, this canister's own ICP balance
+  // (only ever seeded once, up front) would slowly drain to zero as it
+  // keeps advancing mother's fee on every win with no way to replenish
+  // itself, which doesn't scale and isn't something the dev should have
+  // to keep topping up by hand forever (found while designing this: the
+  // family's existing `topUpProject` auto-funding only distributes
+  // CYCLES, never ICP tokens, so it cannot cover this cost at all).
+  // Requires each participant to have `icrc2_approve`d this canister on
+  // the ICP ledger beforehand (same one-time gesture as approving mother
+  // for solo mining) -- a participant who never approves simply forfeits
+  // that round's share, with no separate pre-check needed anywhere else.
+  func distributeRoundReward(reward : Nat, totalFeeE8s : Nat) : async () {
     var total = 0;
     for ((_, c) in Map.entries(currentRoundShares)) { total += c };
     if (total == 0) { return }; // shouldn't happen -- this only runs right after crediting a share this round
 
+    // Snapshot now, before any awaits below -- submitShare calls that land
+    // concurrently during fee collection add to currentRoundShares for the
+    // NEXT round and must not be touched by this round's payout or cleanup.
+    let entries = Iter.toArray(Map.entries(currentRoundShares));
+    let IcpLedger : Types.LedgerActor = actor (Principal.toText(icpLedgerId));
+
     var distributed = 0;
     var highestPrincipal : ?Principal = null;
     var highestCount = 0;
-    for ((p, c) in Map.entries(currentRoundShares)) {
-      let cut = reward * c / total;
-      distributed += cut;
-      let prevPending = switch (Map.get(pendingPoolRewards, Principal.compare, p)) {
-        case (?v) v;
-        case null 0;
+    for ((p, c) in entries.vals()) {
+      let feeShare = totalFeeE8s * c / total;
+      let collected = if (feeShare == 0) { true } else {
+        let outcome = try {
+          ?(
+            await IcpLedger.icrc2_transfer_from({
+              spender_subaccount = null;
+              from = { owner = p; subaccount = null };
+              to = { owner = Principal.fromActor(self); subaccount = null };
+              amount = feeShare;
+              fee = null;
+              memo = null;
+              created_at_time = null;
+            })
+          );
+        } catch (_e) { null };
+        switch (outcome) {
+          case (? #Ok(_)) true;
+          case _ false;
+        };
       };
-      Map.add(pendingPoolRewards, Principal.compare, p, prevPending + cut);
-      if (c > highestCount) { highestCount := c; highestPrincipal := ?p };
+      if (collected) {
+        let cut = reward * c / total;
+        distributed += cut;
+        let prevPending = switch (Map.get(pendingPoolRewards, Principal.compare, p)) {
+          case (?v) v;
+          case null 0;
+        };
+        Map.add(pendingPoolRewards, Principal.compare, p, prevPending + cut);
+        if (c > highestCount) { highestCount := c; highestPrincipal := ?p };
+      };
+      // else: didn't cover their share of the fee -- forfeits this
+      // round's PIKO too. Their share count for the round is simply
+      // dropped below when this round's entries are removed; nothing
+      // else to reverse, since nothing was credited to them.
     };
-    // Integer-division dust goes to the round's biggest contributor -- same
-    // remainder convention pikopoker uses for split pots.
+    // Integer-division dust (from whoever DID get paid) goes to the
+    // round's biggest paying contributor -- same remainder convention
+    // pikopoker uses for split pots.
     let remainder = Int.abs(reward - distributed);
     if (remainder > 0) {
       switch (highestPrincipal) {
@@ -210,7 +267,12 @@ actor self {
         case null {};
       };
     };
-    Map.clear(currentRoundShares);
+    // Remove only this round's own snapshot -- NOT Map.clear, which would
+    // also wipe any new shares that arrived (for the next round) during
+    // this function's awaits above.
+    for ((p, _) in entries.vals()) {
+      Map.remove(currentRoundShares, Principal.compare, p);
+    };
   };
 
   public shared ({ caller }) func submitShare(height : Nat, nonce : Nat) : async Types.ShareResult {
@@ -249,11 +311,20 @@ actor self {
 
     // This share also solves the real block -- claim it under this
     // canister's own principal, then split the reward across the round.
+    // Captured before the call (not read back off cachedWork afterwards):
+    // this is the fee mother is actually about to pull from THIS
+    // canister's own account right now, which is what participants need
+    // to collectively reimburse, regardless of what miningFeeE8s becomes
+    // by the time cachedWork next refreshes.
+    let feeE8sAtWin = cachedWork.miningFeeE8s;
     let Mother : Types.MotherActor = actor (Principal.toText(motherId));
     let result = await Mother.submitProof(nonce);
     switch (result) {
       case (#Ok(ok)) {
-        distributeRoundReward(ok.reward);
+        // + ICP_LEDGER_FEE_E8S: mother's own pull above debited this
+        // canister for feeE8sAtWin PLUS that ledger's transfer fee, not
+        // just feeE8sAtWin -- see the constant's own comment.
+        await distributeRoundReward(ok.reward, feeE8sAtWin + ICP_LEDGER_FEE_E8S);
         blocksWon += 1;
         totalPikoDistributed += ok.reward;
         ignore refreshCachedWork(); // don't wait for the next timer tick to see the new height
