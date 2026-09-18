@@ -1,0 +1,22 @@
+# yaml-language-server: $schema=https://github.com/dfinity/icp-cli/raw/refs/tags/v1.3.0/docs/schemas/icp-yaml-schema.json
+
+# PikoPool -- an independent project, same reasoning as PikoPay/PikoPoker
+# (see ~/pikopoker/icp.yaml): not part of piko-icp's own deploy/canister
+# lifecycle, so mother (the highest-stakes, eventually-blackholed canister
+# in the family) is never touched by this feature's own deploys.
+# `pikopool` talks to the real `mother` and PIKO/ICP ledgers on mainnet by
+# fixed canister id, redirectable to local test canisters for development
+# only (see pikopool/src/main.mo's setter functions / scripts/deploy-local.sh).
+canisters:
+  - test-icp-ledger
+  - test-piko-ledger
+  - test-mother
+  - pikopool
+
+# Ports 8000/8010/8020/8030 are already used by other local icp-cli
+# projects on this machine; use a distinct port for PikoPool's local network.
+networks:
+  - name: local
+    mode: managed
+    gateway:
+      port: 8040

@@ -1,0 +1,123 @@
+type TransferResult = 
+ variant {
+   Err: TransferError;
+   Ok: nat;
+ };
+type TransferError = 
+ variant {
+   BadBurn: record {min_burn_amount: nat;};
+   BadFee: record {expected_fee: nat;};
+   CreatedInFuture: record {ledger_time: nat64;};
+   Duplicate: record {duplicate_of: nat;};
+   GenericError: record {
+                   error_code: nat;
+                   message: text;
+                 };
+   InsufficientFunds: record {balance: nat;};
+   TemporarilyUnavailable;
+   TooOld;
+ };
+type SubmitResult = 
+ variant {
+   Err: SubmitError;
+   Ok: SubmitOk;
+ };
+type SubmitOk = 
+ record {
+   hash: blob;
+   height: nat;
+   reward: nat;
+ };
+type SubmitError = 
+ variant {
+   Anonymous;
+   IcpFeeFailed:
+    variant {
+      BadBurn: record {min_burn_amount: nat;};
+      BadFee: record {expected_fee: nat;};
+      CreatedInFuture: record {ledger_time: nat64;};
+      Duplicate: record {duplicate_of: nat;};
+      GenericError: record {
+                      error_code: nat;
+                      message: text;
+                    };
+      InsufficientAllowance: record {allowance: nat;};
+      InsufficientFunds: record {balance: nat;};
+      TemporarilyUnavailable;
+      TooOld;
+    };
+   InvalidProof;
+   NothingToClaim;
+   StaleWork;
+   TooSoon: record {retryAfterNanos: nat;};
+ };
+type ShareResult = 
+ variant {
+   Err: ShareError;
+   Ok: ShareOutcome;
+ };
+type ShareOutcome = 
+ record {
+   accepted: bool;
+   isBlockWinner: bool;
+   poolSubmitResult: opt SubmitResult;
+ };
+type ShareError = 
+ variant {
+   Anonymous;
+   BelowShareTarget;
+   StaleWork;
+   TooSoon: record {retryAfterNanos: nat;};
+ };
+type PoolStats = 
+ record {
+   blocksWon: nat;
+   currentRoundTotalShares: nat;
+   totalPikoDistributed: nat;
+   totalSharesAllTime: nat;
+ };
+type PoolConfig = 
+ record {
+   height: nat;
+   networkDifficultyBits: nat;
+   shareDifficultyBits: nat;
+ };
+type ApproveResult = 
+ variant {
+   Err: ApproveError;
+   Ok: nat;
+ };
+type ApproveError = 
+ variant {
+   AllowanceChanged: record {current_allowance: nat;};
+   BadFee: record {expected_fee: nat;};
+   CreatedInFuture: record {ledger_time: nat64;};
+   Duplicate: record {duplicate_of: nat;};
+   Expired: record {ledger_time: nat64;};
+   GenericError: record {
+                   error_code: nat;
+                   message: text;
+                 };
+   InsufficientFunds: record {balance: nat;};
+   TemporarilyUnavailable;
+   TooOld;
+ };
+service : {
+  claimPoolReward: () -> (TransferResult);
+  getMyShare: () -> (record {
+                       pendingReward: nat;
+                       sharesThisRound: nat;
+                     }) query;
+  getPoolConfig: () -> (PoolConfig) query;
+  getPoolStats: () -> (PoolStats) query;
+  lockIcpLedgerId: () -> ();
+  lockMotherId: () -> ();
+  lockPikoLedgerId: () -> ();
+  refreshMotherApproval: () -> (ApproveResult);
+  setApprovalCapE8s: (e8s: nat) -> ();
+  setIcpLedgerId: (id: principal) -> ();
+  setMotherId: (id: principal) -> ();
+  setPikoLedgerId: (id: principal) -> ();
+  setShareDifficultyBits: (bits: nat) -> ();
+  submitShare: (height: nat, nonce: nat) -> (ShareResult);
+}

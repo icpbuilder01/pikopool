@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=https://github.com/dfinity/icp-cli/raw/refs/tags/v1.3.0/docs/schemas/canister-yaml-schema.json
+
+# Local-only stand-in for the real PIKO ledger, same reused
+# ic-icrc1-ledger.wasm as PikoPoker's own test-ledger. Never deployed to
+# mainnet. minting_account must be `test-mother`'s own principal (mirrors
+# the real PIKO ledger, whose minting_account is the real `mother`) --
+# rendered from a template after `test-mother` is created, same two-phase
+# trick as piko-icp/scripts/deploy-local.sh.
+name: test-piko-ledger
+recipe:
+  type: "@dfinity/prebuilt@v2.1.0"
+  configuration:
+    path: ic-icrc1-ledger.wasm
+    sha256: a273d741019b4324b22e2e64cfb0239de148ae9693e8801102a04118dfd383c0
+    compress: true
+init_args:
+  path: icrc1_ledger_init.args
+  format: candid

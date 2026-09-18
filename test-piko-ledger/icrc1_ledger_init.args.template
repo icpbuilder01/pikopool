@@ -1,0 +1,30 @@
+(variant {
+  Init = record {
+    minting_account = record { owner = principal "__TEST_MOTHER_PRINCIPAL__"; subaccount = null };
+    fee_collector_account = null;
+    transfer_fee = 10_000 : nat;
+    decimals = opt (8 : nat8);
+    max_memo_length = opt (32 : nat16);
+    token_symbol = "tPIKO";
+    token_name = "Test PIKO (local only)";
+    metadata = vec {
+      record {
+        "icrc1:description";
+        variant { Text = "Local-only stand-in for the real PIKO ledger, minted by test-mother." };
+      };
+    };
+    initial_balances = vec {};
+    feature_flags = opt record { icrc2 = true };
+    archive_options = record {
+      num_blocks_to_archive = 10_000 : nat64;
+      max_transactions_per_response = null;
+      trigger_threshold = 20_000 : nat64;
+      max_message_size_bytes = null;
+      cycles_for_archive_creation = opt (1_000_000_000_000 : nat64);
+      node_max_memory_size_bytes = null;
+      controller_id = principal "__DEPLOYER_PRINCIPAL__";
+      more_controller_ids = null;
+    };
+    index_principal = null;
+  }
+})

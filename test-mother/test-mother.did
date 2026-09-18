@@ -1,0 +1,50 @@
+type Work = 
+ record {
+   difficultyBits: nat;
+   height: nat;
+   miningFeeE8s: nat;
+   previousHash: blob;
+   reward: nat;
+ };
+type TransferFromError = 
+ variant {
+   BadBurn: record {min_burn_amount: nat;};
+   BadFee: record {expected_fee: nat;};
+   CreatedInFuture: record {ledger_time: nat64;};
+   Duplicate: record {duplicate_of: nat;};
+   GenericError: record {
+                   error_code: nat;
+                   message: text;
+                 };
+   InsufficientAllowance: record {allowance: nat;};
+   InsufficientFunds: record {balance: nat;};
+   TemporarilyUnavailable;
+   TooOld;
+ };
+type SubmitResult = 
+ variant {
+   Err: SubmitError;
+   Ok: SubmitOk;
+ };
+type SubmitOk = 
+ record {
+   hash: blob;
+   height: nat;
+   reward: nat;
+ };
+type SubmitError = 
+ variant {
+   Anonymous;
+   IcpFeeFailed: TransferFromError;
+   InvalidProof;
+   NothingToClaim;
+   StaleWork;
+   TooSoon: record {retryAfterNanos: nat;};
+ };
+service : {
+  getWork: () -> (Work) query;
+  submitProof: (nonce: nat) -> (SubmitResult);
+  testSetLedgers: (piko: principal, icp: principal) -> ();
+  testSetWork: (newDifficultyBits: nat, newReward: nat, newMiningFeeE8s:
+   nat) -> ();
+}

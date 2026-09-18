@@ -1,0 +1,13 @@
+[toolchain]
+moc = "1.14.0"
+
+[dependencies]
+core = "2.5.0"
+sha2 = "0.2.5"
+
+[moc]
+args = ["--default-persistent-actors"]
+
+[canisters.pikopool]
+main = "src/main.mo"
+candid = "pikopool.did"

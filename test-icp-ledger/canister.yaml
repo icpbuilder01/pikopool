@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=https://github.com/dfinity/icp-cli/raw/refs/tags/v1.3.0/docs/schemas/canister-yaml-schema.json
+
+# Local-only stand-in for the real ICP ledger, same reused
+# ic-icrc1-ledger.wasm as PikoPoker's own test-ledger (~/pikopoker/test-ledger).
+# Never deployed to mainnet -- pikopool talks to the real ICP ledger by
+# fixed canister id there instead. Minted to the local deployer identity so
+# it can freely fund `pikopool`'s own ICP balance for testing the fee it
+# pays `test-mother`.
+name: test-icp-ledger
+recipe:
+  type: "@dfinity/prebuilt@v2.1.0"
+  configuration:
+    path: ic-icrc1-ledger.wasm
+    sha256: a273d741019b4324b22e2e64cfb0239de148ae9693e8801102a04118dfd383c0
+    compress: true
+init_args:
+  path: icrc1_ledger_init.args
+  format: candid
