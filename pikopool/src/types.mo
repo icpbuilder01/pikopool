@@ -75,11 +75,22 @@ module {
 
   public type TransferFromResult = { #Ok : Nat; #Err : TransferFromError };
 
+  public type AllowanceArgs = {
+    account : Account;
+    spender : Account;
+  };
+
+  public type Allowance = {
+    allowance : Nat;
+    expires_at : ?Nat64;
+  };
+
   public type LedgerActor = actor {
     icrc1_transfer : (TransferArg) -> async TransferResult;
     icrc1_balance_of : (Account) -> async Nat;
     icrc2_approve : (ApproveArgs) -> async ApproveResult;
     icrc2_transfer_from : (TransferFromArgs) -> async TransferFromResult;
+    icrc2_allowance : (AllowanceArgs) -> async Allowance;
   };
 
   // Mirrors mother/src/types.mo's Work/SubmitOk/SubmitError/SubmitResult

@@ -9,6 +9,7 @@ import Time "mo:core/Time";
 import Runtime "mo:core/Runtime";
 import Timer "mo:core/Timer";
 import Map "mo:core/Map";
+import List "mo:core/List";
 import Iter "mo:core/Iter";
 import Sha256 "mo:sha2/Sha256";
 import Types "types";
@@ -244,12 +245,64 @@ actor self {
     let usedNonceKeysThisRound = Iter.toArray(Map.keys(usedNoncesThisRound));
     let IcpLedger : Types.LedgerActor = actor (Principal.toText(icpLedgerId));
 
+    // Pass 1 -- cheap allowance PRE-check (query, moves no funds) against
+    // each participant's own nominal share of the full fee. This is what
+    // makes the redistribution below order-independent: without it, a
+    // non-payer only inflates what LATER entries (in Map's own iteration
+    // order, effectively arbitrary) end up owing, and does nothing at all
+    // if they happen to be ordered last. Anyone who fails this check is
+    // excluded from `payableTotal` up front, so every eligible entry's
+    // real feeShare below is computed against the same, already-correct
+    // pool of payers regardless of iteration order.
+    var payableTotal = 0;
+    let eligible = List.empty<Bool>();
+    for ((p, c) in entries.vals()) {
+      let nominalShare = totalFeeE8s * c / total;
+      let ok = if (nominalShare == 0) { true } else {
+        let allowance = try {
+          ?(
+            await IcpLedger.icrc2_allowance({
+              account = { owner = p; subaccount = null };
+              spender = { owner = Principal.fromActor(self); subaccount = null };
+            })
+          );
+        } catch (_e) { null };
+        switch (allowance) {
+          case (?a) a.allowance >= nominalShare;
+          case null false;
+        };
+      };
+      if (ok) { payableTotal += c };
+      List.add(eligible, ok);
+    };
+
     var distributed = 0;
     var highestPrincipal : ?Principal = null;
     var highestCount = 0;
+    // Pass 2 -- waterfall allocation among the pre-checked-eligible cohort
+    // only: feeShare is recomputed against `shareWeight` (starts at
+    // payableTotal, shrinks as each eligible entry is processed) rather
+    // than a fixed per-participant amount, so if a real transfer_from
+    // still fails despite passing pass 1 (e.g. real balance short despite
+    // a healthy allowance -- rarer, but the pre-check can't catch it),
+    // whoever's processed after them absorbs the gap the same way.
+    // Without either pass, a single non-paying participant permanently
+    // drained pikopool's own ICP reserve by exactly their share, every
+    // single win, with nothing else ever making up the difference --
+    // confirmed live: pikopool's real balance drained from ~0.26 ICP to
+    // ~0.0097 ICP over just 3 real wins, well below the 0.2501 ICP a win
+    // costs, silently failing the next win attempt with IcpFeeFailed.
+    // This mirrors the PIKO reward side's own existing sweep-to-biggest-
+    // contributor mechanism (below), which already guarantees 100% of the
+    // REWARD gets distributed -- this does the same for the FEE side.
+    var feeNeeded = totalFeeE8s;
+    var shareWeight = payableTotal;
+    var i = 0;
     for ((p, c) in entries.vals()) {
-      let feeShare = totalFeeE8s * c / total;
-      let collected = if (feeShare == 0) { true } else {
+      let isEligible = switch (List.get(eligible, i)) { case (?v) v; case null false };
+      i += 1;
+      let feeShare = if (not isEligible or shareWeight == 0) { 0 } else { feeNeeded * c / shareWeight };
+      let collected = if (not isEligible) { false } else if (feeShare == 0) { true } else {
         let outcome = try {
           ?(
             await IcpLedger.icrc2_transfer_from({
@@ -268,7 +321,19 @@ actor self {
           case _ false;
         };
       };
+      // Remove this participant's weight from the remaining payable pool
+      // (only meaningful for eligible entries -- shareWeight only ever
+      // counted payableTotal to begin with) so whoever's processed after
+      // them has their share of the STILL-needed fee recomputed against
+      // what's left. On success, feeNeeded also drops by what they just
+      // paid; on a same-pass failure despite passing pass 1, it's left
+      // untouched, so their unpaid portion becomes everyone-after-them's
+      // problem -- exactly mirroring how their own forfeited PIKO reward
+      // (below) already gets swept to the round's biggest paying
+      // contributor.
+      if (isEligible) { shareWeight -= c };
       if (collected) {
+        feeNeeded -= feeShare;
         let cut = reward * c / total;
         distributed += cut;
         let prevPending = switch (Map.get(pendingPoolRewards, Principal.compare, p)) {
