@@ -437,6 +437,10 @@ actor self {
         await distributeRoundReward(ok.reward, feeE8sAtWin + ICP_LEDGER_FEE_E8S);
         blocksWon += 1;
         totalPikoDistributed += ok.reward;
+        // Top the mother allowance back up NOW, not only after a failure:
+        // each win consumes ~miningFee of the cap, so waiting for
+        // IcpFeeFailed means every Nth win is lost (seen 2026-09-20).
+        ignore refreshMotherApproval();
         ignore refreshCachedWork(); // don't wait for the next timer tick to see the new height
       };
       case (#Err(#IcpFeeFailed(_))) {
