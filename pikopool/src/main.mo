@@ -175,9 +175,42 @@ actor self {
   transient let lastSeenAt : Map.Map<Principal, Int> = Map.empty<Principal, Int>();
   let ACTIVE_WINDOW_NANOS : Int = 60_000_000_000; // 60s -- comfortably above the client's own heartbeat interval
 
-  public shared ({ caller }) func heartbeat() : async () {
+  public shared ({ caller }) func heartbeat<system>() : async () {
     if (Principal.isAnonymous(caller)) { return };
-    Map.add(lastSeenAt, Principal.compare, caller, Time.now());
+    if (noteMinerActive<system>(caller)) { ignore refreshCachedWork() };
+  };
+
+  // Polling mother costs about 42M cycles per call, which every 10s came to
+  // ~360B cycles/day whether or not anyone was mining. So the work timer only
+  // runs while a miner has been seen within ACTIVE_WINDOW_NANOS: it starts on
+  // the first heartbeat or share and stops itself once they all go quiet.
+  // Returns true when this woke the timer up: cachedWork may then be hours
+  // old, so the caller should refresh it right away.
+  func noteMinerActive<system>(miner : Principal) : Bool {
+    Map.add(lastSeenAt, Principal.compare, miner, Time.now());
+    if (workTimerId != null) { return false };
+    armWorkTimer<system>();
+    true;
+  };
+
+  func anyMinerActive() : Bool {
+    let now = Time.now();
+    for ((_, seenAt) in Map.entries(lastSeenAt)) {
+      if (now - seenAt < ACTIVE_WINDOW_NANOS) { return true };
+    };
+    false;
+  };
+
+  func onWorkTimer() : async () {
+    if (anyMinerActive()) {
+      await refreshCachedWork();
+    } else {
+      switch (workTimerId) {
+        case (?id) { Timer.cancelTimer(id) };
+        case null {};
+      };
+      workTimerId := null;
+    };
   };
 
   // Fixed for the ICP ledger's whole history, same constant mother/
@@ -375,7 +408,7 @@ actor self {
     };
   };
 
-  public shared ({ caller }) func submitShare(height : Nat, nonce : Nat) : async Types.ShareResult {
+  public shared ({ caller }) func submitShare<system>(height : Nat, nonce : Nat) : async Types.ShareResult {
     if (Principal.isAnonymous(caller)) { return #Err(#Anonymous) };
 
     let now = Time.now();
@@ -389,6 +422,8 @@ actor self {
       case null {};
     };
     Map.add(lastShareAttempt, Principal.compare, caller, now);
+    // Older clients send shares without heartbeats.
+    if (noteMinerActive<system>(caller)) { ignore refreshCachedWork() };
 
     if (height != cachedWork.height) { return #Err(#StaleWork) };
 
@@ -560,25 +595,15 @@ actor self {
     };
   };
 
-  // ---- Timer setup (does not survive upgrades under enhanced orthogonal
-  // persistence -- same reasoning/pattern as mother's own armSweepTimer:
-  // the top-level call runs on first install, postupgrade re-arms it
-  // afterwards) ----
+  // ---- Timer setup ----
   func armWorkTimer<system>() {
     switch (workTimerId) {
       case (?id) { Timer.cancelTimer(id) };
       case null {};
     };
-    workTimerId := ?Timer.recurringTimer<system>(#seconds REFRESH_INTERVAL_SECONDS, refreshCachedWork);
+    workTimerId := ?Timer.recurringTimer<system>(#seconds REFRESH_INTERVAL_SECONDS, onWorkTimer);
   };
 
-  system func postupgrade() {
-    armWorkTimer<system>();
-  };
-
-  // (No initial synchronous fetch here -- top-level actor init has no send
-  // capability for an async call. The timer's first fire, up to
-  // REFRESH_INTERVAL_SECONDS after install, populates cachedWork for real;
-  // until then every submitShare's height check safely fails as #StaleWork.)
-  armWorkTimer<system>();
+  // Timers do not survive upgrades, and workTimerId resets with them, so the
+  // next heartbeat or share simply starts the timer again.
 };
