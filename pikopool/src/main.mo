@@ -8,8 +8,8 @@ import Array "mo:core/Array";
 import Time "mo:core/Time";
 import Runtime "mo:core/Runtime";
 import Timer "mo:core/Timer";
+import VarArray "mo:core/VarArray";
 import Map "mo:core/Map";
-import List "mo:core/List";
 import Iter "mo:core/Iter";
 import Sha256 "mo:sha2/Sha256";
 import Types "types";
@@ -78,6 +78,16 @@ actor self {
   // same reasoning as mother's setMiningFeeE8s: moves credit-granularity
   // for everyone equally, can't target anyone, low blast radius) ----
   var shareDifficultyBits : Nat = 16; // conservative default, tune after watching real submission volume
+
+  // Mother's difficulty can now fall on its own while no block is found. Shares
+  // must stay easier than the real target, or they stop splitting the work
+  // and valid winning hashes get rejected as below the share target.
+  transient let MIN_SHARE_BITS_BELOW_NETWORK : Nat = 6;
+  func effectiveShareBits() : Nat {
+    let network = cachedWork.difficultyBits;
+    let ceiling = if (network > MIN_SHARE_BITS_BELOW_NETWORK) { network - MIN_SHARE_BITS_BELOW_NETWORK } else { 1 };
+    Nat.min(shareDifficultyBits, ceiling);
+  };
 
   public shared ({ caller }) func setShareDifficultyBits(bits : Nat) : async () {
     requireController(caller);
@@ -251,6 +261,43 @@ actor self {
     Sha256.fromArray(#sha256, Array.concat(Array.concat(Blob.toArray(prev), natToBytes8(atHeight)), natToBytes8(nonce)));
   };
 
+  // What a participant can really pay right now: transfer_from debits both their
+  // balance and their allowance for the amount plus the ledger fee.
+  func payingCapacity(p : Principal) : async Nat {
+    let IcpLedger : Types.LedgerActor = actor (Principal.toText(icpLedgerId));
+    let account = { owner = p; subaccount = null };
+    let allowance = try {
+      (await IcpLedger.icrc2_allowance({ account; spender = { owner = Principal.fromActor(self); subaccount = null } })).allowance;
+    } catch (_e) { 0 };
+    let balance = try { await IcpLedger.icrc1_balance_of(account) } catch (_e) { 0 };
+    let spendable = Nat.min(allowance, balance);
+    if (spendable > ICP_LEDGER_FEE_E8S) { spendable - ICP_LEDGER_FEE_E8S } else { 0 };
+  };
+
+  // Who can cover their share of the fee. Dropping a participant raises what
+  // the others owe, so this repeats until everyone left can afford their share.
+  func payingCohort(entries : [(Principal, Nat)], totalFeeE8s : Nat) : async { eligible : [Bool]; weight : Nat } {
+    let capacities = VarArray.repeat<Nat>(0, entries.size());
+    for (i in Nat.range(0, entries.size())) { capacities[i] := await payingCapacity(entries[i].0) };
+    let eligible = VarArray.repeat<Bool>(true, entries.size());
+    var weight = 0;
+    for ((_, c) in entries.vals()) { weight += c };
+    var changed = true;
+    while (changed and weight > 0) {
+      changed := false;
+      let weightThisPass = weight;
+      for (i in Nat.range(0, entries.size())) {
+        // + 1: the waterfall in distributeRoundReward can round a share up by one.
+        if (eligible[i] and totalFeeE8s * entries[i].1 / weightThisPass + 1 > capacities[i]) {
+          eligible[i] := false;
+          weight -= entries[i].1;
+          changed := true;
+        };
+      };
+    };
+    { eligible = Array.fromVarArray(eligible); weight };
+  };
+
   // Collects each participant's proportional share of the ICP mining fee
   // this canister just advanced to mother, THEN credits their PIKO reward
   // -- no successful collection, no reward, full stop. This is the entire
@@ -278,36 +325,11 @@ actor self {
     let usedNonceKeysThisRound = Iter.toArray(Map.keys(usedNoncesThisRound));
     let IcpLedger : Types.LedgerActor = actor (Principal.toText(icpLedgerId));
 
-    // Pass 1 -- cheap allowance PRE-check (query, moves no funds) against
-    // each participant's own nominal share of the full fee. This is what
-    // makes the redistribution below order-independent: without it, a
-    // non-payer only inflates what LATER entries (in Map's own iteration
-    // order, effectively arbitrary) end up owing, and does nothing at all
-    // if they happen to be ordered last. Anyone who fails this check is
-    // excluded from `payableTotal` up front, so every eligible entry's
-    // real feeShare below is computed against the same, already-correct
-    // pool of payers regardless of iteration order.
-    var payableTotal = 0;
-    let eligible = List.empty<Bool>();
-    for ((p, c) in entries.vals()) {
-      let nominalShare = totalFeeE8s * c / total;
-      let ok = if (nominalShare == 0) { true } else {
-        let allowance = try {
-          ?(
-            await IcpLedger.icrc2_allowance({
-              account = { owner = p; subaccount = null };
-              spender = { owner = Principal.fromActor(self); subaccount = null };
-            })
-          );
-        } catch (_e) { null };
-        switch (allowance) {
-          case (?a) a.allowance >= nominalShare;
-          case null false;
-        };
-      };
-      if (ok) { payableTotal += c };
-      List.add(eligible, ok);
-    };
+    // Pass 1 -- find who can pay before moving anything, so a non-payer only
+    // raises the share of participants who can actually afford it, whatever
+    // their order in the Map.
+    let cohort = await payingCohort(entries, totalFeeE8s);
+    let payableTotal = cohort.weight;
 
     var distributed = 0;
     var highestPrincipal : ?Principal = null;
@@ -316,8 +338,8 @@ actor self {
     // only: feeShare is recomputed against `shareWeight` (starts at
     // payableTotal, shrinks as each eligible entry is processed) rather
     // than a fixed per-participant amount, so if a real transfer_from
-    // still fails despite passing pass 1 (e.g. real balance short despite
-    // a healthy allowance -- rarer, but the pre-check can't catch it),
+    // still fails despite passing pass 1 (e.g. the balance was spent between
+    // the two passes),
     // whoever's processed after them absorbs the gap the same way.
     // Without either pass, a single non-paying participant permanently
     // drained pikopool's own ICP reserve by exactly their share, every
@@ -332,7 +354,7 @@ actor self {
     var shareWeight = payableTotal;
     var i = 0;
     for ((p, c) in entries.vals()) {
-      let isEligible = switch (List.get(eligible, i)) { case (?v) v; case null false };
+      let isEligible = cohort.eligible[i];
       i += 1;
       let feeShare = if (not isEligible or shareWeight == 0) { 0 } else { feeNeeded * c / shareWeight };
       let collected = if (not isEligible) { false } else if (feeShare == 0) { true } else {
@@ -429,7 +451,7 @@ actor self {
 
     let candidateHash = computeHash(cachedWork.previousHash, height, nonce);
     let zeroBits = leadingZeroBits(candidateHash);
-    if (zeroBits < shareDifficultyBits) { return #Err(#BelowShareTarget) };
+    if (zeroBits < effectiveShareBits()) { return #Err(#BelowShareTarget) };
 
     // Reject a nonce already credited this round, to anyone -- the hash
     // only depends on (previousHash, height, nonce), never on the caller,
@@ -462,14 +484,19 @@ actor self {
     // to collectively reimburse, regardless of what miningFeeE8s becomes
     // by the time cachedWork next refreshes.
     let feeE8sAtWin = cachedWork.miningFeeE8s;
+    // What this win costs the pool: mother's pull debits the fee plus one ledger
+    // fee, and refreshing the allowance afterwards costs one more.
+    let roundCostE8s = feeE8sAtWin + 2 * ICP_LEDGER_FEE_E8S;
+    // Never advance a fee nobody can reimburse: that is how the reserve drained.
+    let roundEntries = Iter.toArray(Map.entries(currentRoundShares));
+    if ((await payingCohort(roundEntries, roundCostE8s)).weight == 0) {
+      return #Ok({ accepted = true; isBlockWinner = true; poolSubmitResult = ?#Err(#IcpFeeFailed(#InsufficientAllowance({ allowance = 0 }))) });
+    };
     let Mother : Types.MotherActor = actor (Principal.toText(motherId));
     let result = await Mother.submitProof(nonce);
     switch (result) {
       case (#Ok(ok)) {
-        // + ICP_LEDGER_FEE_E8S: mother's own pull above debited this
-        // canister for feeE8sAtWin PLUS that ledger's transfer fee, not
-        // just feeE8sAtWin -- see the constant's own comment.
-        await distributeRoundReward(ok.reward, feeE8sAtWin + ICP_LEDGER_FEE_E8S);
+        await distributeRoundReward(ok.reward, roundCostE8s);
         blocksWon += 1;
         totalPikoDistributed += ok.reward;
         // Top the mother allowance back up NOW, not only after a failure:
@@ -478,11 +505,10 @@ actor self {
         ignore refreshMotherApproval();
         ignore refreshCachedWork(); // don't wait for the next timer tick to see the new height
       };
-      case (#Err(#IcpFeeFailed(_))) {
-        // Most likely: this canister's mother-spender allowance ran out.
-        // Best-effort self-heal so the NEXT winning share (whenever the
-        // next block is found) has a fresh approval; this round's share
-        // credit is not lost either way.
+      case (#Err(#IcpFeeFailed(#InsufficientAllowance(_)))) {
+        // Self-heal so the next winning share has a fresh approval; this round's
+        // share credit is not lost either way. Any other cause is left alone,
+        // since approving costs a ledger fee and would not help.
         ignore refreshMotherApproval();
       };
       case (#Err(#StaleWork)) {
@@ -562,7 +588,7 @@ actor self {
 
   // ---- Queries ----
   public query func getPoolConfig() : async Types.PoolConfig {
-    { shareDifficultyBits; networkDifficultyBits = cachedWork.difficultyBits; height = cachedWork.height };
+    { shareDifficultyBits = effectiveShareBits(); networkDifficultyBits = cachedWork.difficultyBits; height = cachedWork.height };
   };
 
   public query func getPoolStats() : async Types.PoolStats {
