@@ -137,6 +137,8 @@ actor self {
   // Now it first reads the remaining allowance (no ICP spent) and only
   // approves when that is running low, at most once per minute.
   transient let APPROVAL_MIN_INTERVAL_NANOS : Int = 60_000_000_000;
+  transient let MAX_ROUND_PARTICIPANTS : Nat = 25;
+  transient let ROUND_FULL_RETRY_NANOS : Nat = 60_000_000_000;
   transient var lastMotherApprovalAt : Int = 0;
 
   public shared func refreshMotherApproval() : async Types.ApproveResult {
@@ -504,6 +506,20 @@ actor self {
     let candidateHash = computeHash(cachedWork.previousHash, height, nonce);
     let zeroBits = leadingZeroBits(candidateHash);
     if (zeroBits < effectiveShareBits()) { return #Err(#BelowShareTarget) };
+
+    // At most MAX_ROUND_PARTICIPANTS distinct participants per round: a win
+    // makes ~3 sequential ICP ledger calls per participant, so an unbounded
+    // round (cheap shares from many fresh principals) could take longer than
+    // WIN_GUARD_NANOS on mainnet. A newcomer to a full round is told to retry
+    // later (TooSoon, which existing miners already handle), unless the share
+    // wins the block outright: the pool never turns down a block.
+    if (
+      not Map.containsKey(currentRoundShares, Principal.compare, caller) and
+      Map.size(currentRoundShares) >= MAX_ROUND_PARTICIPANTS and
+      zeroBits < cachedWork.difficultyBits
+    ) {
+      return #Err(#TooSoon({ retryAfterNanos = ROUND_FULL_RETRY_NANOS }));
+    };
 
     // Reject a nonce already credited this round, to anyone -- the hash
     // only depends on (previousHash, height, nonce), never on the caller,
