@@ -131,8 +131,35 @@ actor self {
     };
   };
 
+  // Public so anyone can unstick the pool, but each icrc2_approve costs the
+  // pool a ledger fee: it used to approve on every call, so anyone could drain
+  // the pool's ICP for free, one fee per call (found in the 2026-11-08 audit).
+  // Now it first reads the remaining allowance (no ICP spent) and only
+  // approves when that is running low, at most once per minute.
+  transient let APPROVAL_MIN_INTERVAL_NANOS : Int = 60_000_000_000;
+  transient var lastMotherApprovalAt : Int = 0;
+
   public shared func refreshMotherApproval() : async Types.ApproveResult {
     let IcpLedger : Types.LedgerActor = actor (Principal.toText(icpLedgerId));
+    let remaining = try {
+      (
+        await IcpLedger.icrc2_allowance({
+          account = { owner = Principal.fromActor(self); subaccount = null };
+          spender = { owner = motherId; subaccount = null };
+        })
+      ).allowance;
+    } catch (_e) {
+      return #Err(#TemporarilyUnavailable);
+    };
+    let nextBlockNeeds = cachedWork.miningFeeE8s + ICP_LEDGER_FEE_E8S;
+    if (remaining >= approvalCapE8s / 2 and remaining >= nextBlockNeeds) {
+      return #Err(#GenericError({ error_code = 0; message = "allowance still sufficient" }));
+    };
+    let now = Time.now();
+    if (now - lastMotherApprovalAt < APPROVAL_MIN_INTERVAL_NANOS) {
+      return #Err(#TemporarilyUnavailable);
+    };
+    lastMotherApprovalAt := now;
     await IcpLedger.icrc2_approve({
       from_subaccount = null;
       spender = { owner = motherId; subaccount = null };
