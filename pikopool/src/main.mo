@@ -264,7 +264,12 @@ actor self {
 
   // What a participant can really pay right now: transfer_from debits both their
   // balance and their allowance for the amount plus the ledger fee.
-  func payingCapacity(p : Principal) : async Nat {
+  // async* (not async) on the helpers below that move funds: they run inside
+  // the caller's message instead of as self-calls. A self-call can fail to even
+  // be sent when the canister is short of cycles, and that failure would skip
+  // the rest of the caller (a payout or refund lost). Found by a load test on
+  // PikoBlackjack, 2026-11-07.
+  func payingCapacity(p : Principal) : async* Nat {
     let IcpLedger : Types.LedgerActor = actor (Principal.toText(icpLedgerId));
     let account = { owner = p; subaccount = null };
     let allowance = try {
@@ -277,9 +282,9 @@ actor self {
 
   // Who can cover their share of the fee. Dropping a participant raises what
   // the others owe, so this repeats until everyone left can afford their share.
-  func payingCohort(entries : [(Principal, Nat)], totalFeeE8s : Nat) : async { eligible : [Bool]; weight : Nat } {
+  func payingCohort(entries : [(Principal, Nat)], totalFeeE8s : Nat) : async* { eligible : [Bool]; weight : Nat } {
     let capacities = VarArray.repeat<Nat>(0, entries.size());
-    for (i in Nat.range(0, entries.size())) { capacities[i] := await payingCapacity(entries[i].0) };
+    for (i in Nat.range(0, entries.size())) { capacities[i] := await* payingCapacity(entries[i].0) };
     let eligible = VarArray.repeat<Bool>(true, entries.size());
     var weight = 0;
     for ((_, c) in entries.vals()) { weight += c };
@@ -309,8 +314,8 @@ actor self {
 
   // Waterfall among those who can pay: each share is recomputed against what is
   // still needed, so a transfer that fails anyway falls on whoever comes next.
-  func collectRoundFee(entries : [(Principal, Nat)], totalFeeE8s : Nat) : async RoundFee {
-    let cohort = await payingCohort(entries, totalFeeE8s);
+  func collectRoundFee(entries : [(Principal, Nat)], totalFeeE8s : Nat) : async* RoundFee {
+    let cohort = await* payingCohort(entries, totalFeeE8s);
     let IcpLedger : Types.LedgerActor = actor (Principal.toText(icpLedgerId));
     let payments = List.empty<RoundPayment>();
     var feeNeeded = totalFeeE8s;
@@ -360,7 +365,7 @@ actor self {
     Map.add(pendingFeeRefunds, Principal.compare, p, prev + amount);
   };
 
-  func sendFeeRefund(p : Principal, owed : Nat) : async Types.TransferResult {
+  func sendFeeRefund(p : Principal, owed : Nat) : async* Types.TransferResult {
     if (owed <= ICP_LEDGER_FEE_E8S) { return #Err(#GenericError({ error_code = 0; message = "nothing to refund, or too small to cover the network fee" })) };
     let IcpLedger : Types.LedgerActor = actor (Principal.toText(icpLedgerId));
     let outcome = try {
@@ -382,9 +387,9 @@ actor self {
     };
   };
 
-  func refundRoundFee(payments : [RoundPayment]) : async () {
+  func refundRoundFee(payments : [RoundPayment]) : async* () {
     for (payment in payments.vals()) {
-      if (payment.paid > ICP_LEDGER_FEE_E8S) { ignore (await sendFeeRefund(payment.participant, payment.paid)) };
+      if (payment.paid > ICP_LEDGER_FEE_E8S) { ignore (await* sendFeeRefund(payment.participant, payment.paid)) };
     };
   };
 
@@ -397,7 +402,7 @@ actor self {
       case null 0;
     };
     Map.remove(pendingFeeRefunds, Principal.compare, caller); // clear before awaiting -- no double-claim
-    await sendFeeRefund(caller, owed);
+    await* sendFeeRefund(caller, owed);
   };
 
   public shared query ({ caller }) func getMyFeeRefund() : async Nat {
@@ -506,9 +511,9 @@ actor self {
     let nonces = Iter.toArray(Map.keys(usedNoncesThisRound));
     // What this win costs the pool: mother's pull debits the fee plus one ledger
     // fee, and refreshing the allowance afterwards costs one more.
-    let roundFee = await collectRoundFee(entries, cachedWork.miningFeeE8s + 2 * ICP_LEDGER_FEE_E8S);
+    let roundFee = await* collectRoundFee(entries, cachedWork.miningFeeE8s + 2 * ICP_LEDGER_FEE_E8S);
     if (not roundFee.fullyFunded) {
-      await refundRoundFee(roundFee.payments);
+      await* refundRoundFee(roundFee.payments);
       winStartedAt := 0;
       return #Ok({ accepted = true; isBlockWinner = true; poolSubmitResult = ?#Err(#IcpFeeFailed(#InsufficientAllowance({ allowance = 0 }))) });
     };
@@ -524,17 +529,17 @@ actor self {
         totalPikoDistributed += ok.reward;
         // Each win consumes the allowance, so renew it now rather than lose a
         // later win to it (seen 2026-09-20).
-        ignore refreshMotherApproval();
-        ignore refreshCachedWork(); // don't wait for the next timer tick to see the new height
+        try { ignore refreshMotherApproval() } catch (_e) {};
+        try { ignore refreshCachedWork() } catch (_e) {}; // don't wait for the next timer tick to see the new height
       };
       case (#Err(e)) {
         // Shares stay credited and carry over to the next win.
         switch (e) {
-          case (#IcpFeeFailed(#InsufficientAllowance(_))) { ignore refreshMotherApproval() };
-          case (#StaleWork) { ignore refreshCachedWork() };
+          case (#IcpFeeFailed(#InsufficientAllowance(_))) { try { ignore refreshMotherApproval() } catch (_e) {} };
+          case (#StaleWork) { try { ignore refreshCachedWork() } catch (_e) {} };
           case _ {};
         };
-        await refundRoundFee(roundFee.payments);
+        await* refundRoundFee(roundFee.payments);
       };
     };
     winStartedAt := 0;
