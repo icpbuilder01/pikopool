@@ -10,6 +10,7 @@ import Runtime "mo:core/Runtime";
 import Timer "mo:core/Timer";
 import VarArray "mo:core/VarArray";
 import Map "mo:core/Map";
+import List "mo:core/List";
 import Iter "mo:core/Iter";
 import Sha256 "mo:sha2/Sha256";
 import Types "types";
@@ -298,114 +299,133 @@ actor self {
     { eligible = Array.fromVarArray(eligible); weight };
   };
 
-  // Collects each participant's proportional share of the ICP mining fee
-  // this canister just advanced to mother, THEN credits their PIKO reward
-  // -- no successful collection, no reward, full stop. This is the entire
-  // sustainability mechanism: without it, this canister's own ICP balance
-  // (only ever seeded once, up front) would slowly drain to zero as it
-  // keeps advancing mother's fee on every win with no way to replenish
-  // itself, which doesn't scale and isn't something the dev should have
-  // to keep topping up by hand forever (found while designing this: the
-  // family's existing `topUpProject` auto-funding only distributes
-  // CYCLES, never ICP tokens, so it cannot cover this cost at all).
-  // Requires each participant to have `icrc2_approve`d this canister on
-  // the ICP ledger beforehand (same one-time gesture as approving mother
-  // for solo mining) -- a participant who never approves simply forfeits
-  // that round's share, with no separate pre-check needed anywhere else.
-  func distributeRoundReward(reward : Nat, totalFeeE8s : Nat) : async () {
-    var total = 0;
-    for ((_, c) in Map.entries(currentRoundShares)) { total += c };
-    if (total == 0) { return }; // shouldn't happen -- this only runs right after crediting a share this round
+  // Pay first: the round's fee is collected from participants BEFORE the proof
+  // goes to mother, so the pool never spends ICP it has not already received.
+  // Advancing the fee and collecting afterwards let one participant who could not
+  // pay drain the pool's ICP (drained below the fee in 2026-10, and every win then
+  // failed for five weeks). A failed proof refunds everyone instead.
+  type RoundPayment = { participant : Principal; shares : Nat; paid : Nat };
+  type RoundFee = { payments : [RoundPayment]; fullyFunded : Bool };
 
-    // Snapshot now, before any awaits below -- submitShare calls that land
-    // concurrently during fee collection add to currentRoundShares (and
-    // usedNoncesThisRound) for the NEXT round and must not be touched by
-    // this round's payout or cleanup.
-    let entries = Iter.toArray(Map.entries(currentRoundShares));
-    let usedNonceKeysThisRound = Iter.toArray(Map.keys(usedNoncesThisRound));
-    let IcpLedger : Types.LedgerActor = actor (Principal.toText(icpLedgerId));
-
-    // Pass 1 -- find who can pay before moving anything, so a non-payer only
-    // raises the share of participants who can actually afford it, whatever
-    // their order in the Map.
+  // Waterfall among those who can pay: each share is recomputed against what is
+  // still needed, so a transfer that fails anyway falls on whoever comes next.
+  func collectRoundFee(entries : [(Principal, Nat)], totalFeeE8s : Nat) : async RoundFee {
     let cohort = await payingCohort(entries, totalFeeE8s);
-    let payableTotal = cohort.weight;
+    let IcpLedger : Types.LedgerActor = actor (Principal.toText(icpLedgerId));
+    let payments = List.empty<RoundPayment>();
+    var feeNeeded = totalFeeE8s;
+    var shareWeight = cohort.weight;
+    for (i in Nat.range(0, entries.size())) {
+      if (cohort.eligible[i] and shareWeight > 0) {
+        let (participant, shares) = entries[i];
+        let feeShare = feeNeeded * shares / shareWeight;
+        shareWeight -= shares;
+        let collected = if (feeShare == 0) { true } else {
+          let outcome = try {
+            ?(
+              await IcpLedger.icrc2_transfer_from({
+                spender_subaccount = null;
+                from = { owner = participant; subaccount = null };
+                to = { owner = Principal.fromActor(self); subaccount = null };
+                amount = feeShare;
+                fee = null;
+                memo = null;
+                created_at_time = null;
+              })
+            );
+          } catch (_e) { null };
+          switch (outcome) {
+            case (? #Ok(_)) true;
+            case _ false;
+          };
+        };
+        if (collected) {
+          feeNeeded -= feeShare;
+          List.add(payments, { participant; shares; paid = feeShare });
+        };
+      };
+    };
+    { payments = List.toArray(payments); fullyFunded = feeNeeded == 0 };
+  };
 
+  // Each refund costs the pool one ledger fee, so it comes out of the refund.
+  // Anything that fails stays claimable through claimFeeRefund.
+  let pendingFeeRefunds : Map.Map<Principal, Nat> = Map.empty<Principal, Nat>();
+
+  func addFeeRefund(p : Principal, amount : Nat) {
+    let prev = switch (Map.get(pendingFeeRefunds, Principal.compare, p)) {
+      case (?v) v;
+      case null 0;
+    };
+    Map.add(pendingFeeRefunds, Principal.compare, p, prev + amount);
+  };
+
+  func sendFeeRefund(p : Principal, owed : Nat) : async Types.TransferResult {
+    if (owed <= ICP_LEDGER_FEE_E8S) { return #Err(#GenericError({ error_code = 0; message = "nothing to refund, or too small to cover the network fee" })) };
+    let IcpLedger : Types.LedgerActor = actor (Principal.toText(icpLedgerId));
+    let outcome = try {
+      ?(
+        await IcpLedger.icrc1_transfer({
+          from_subaccount = null;
+          to = { owner = p; subaccount = null };
+          amount = owed - ICP_LEDGER_FEE_E8S : Nat;
+          fee = null;
+          memo = null;
+          created_at_time = null;
+        })
+      );
+    } catch (_e) { null };
+    switch (outcome) {
+      case (? #Ok(idx)) { #Ok(idx) };
+      case (? #Err(e)) { addFeeRefund(p, owed); #Err(e) };
+      case null { addFeeRefund(p, owed); #Err(#TemporarilyUnavailable) };
+    };
+  };
+
+  func refundRoundFee(payments : [RoundPayment]) : async () {
+    for (payment in payments.vals()) {
+      if (payment.paid > ICP_LEDGER_FEE_E8S) { ignore (await sendFeeRefund(payment.participant, payment.paid)) };
+    };
+  };
+
+  public shared ({ caller }) func claimFeeRefund() : async Types.TransferResult {
+    if (Principal.isAnonymous(caller)) {
+      return #Err(#GenericError({ error_code = 0; message = "anonymous caller" }));
+    };
+    let owed = switch (Map.get(pendingFeeRefunds, Principal.compare, caller)) {
+      case (?v) v;
+      case null 0;
+    };
+    Map.remove(pendingFeeRefunds, Principal.compare, caller); // clear before awaiting -- no double-claim
+    await sendFeeRefund(caller, owed);
+  };
+
+  public shared query ({ caller }) func getMyFeeRefund() : async Nat {
+    switch (Map.get(pendingFeeRefunds, Principal.compare, caller)) {
+      case (?v) v;
+      case null 0;
+    };
+  };
+
+  // Credits the won block to those who paid, then closes the round. Whoever did
+  // not pay forfeits: their PIKO ends up with the biggest paying contributor,
+  // along with the integer-division dust.
+  func creditRound(reward : Nat, entries : [(Principal, Nat)], nonces : [Nat], payments : [RoundPayment]) {
+    var total = 0;
+    for ((_, c) in entries.vals()) { total += c };
     var distributed = 0;
     var highestPrincipal : ?Principal = null;
     var highestCount = 0;
-    // Pass 2 -- waterfall allocation among the pre-checked-eligible cohort
-    // only: feeShare is recomputed against `shareWeight` (starts at
-    // payableTotal, shrinks as each eligible entry is processed) rather
-    // than a fixed per-participant amount, so if a real transfer_from
-    // still fails despite passing pass 1 (e.g. the balance was spent between
-    // the two passes),
-    // whoever's processed after them absorbs the gap the same way.
-    // Without either pass, a single non-paying participant permanently
-    // drained pikopool's own ICP reserve by exactly their share, every
-    // single win, with nothing else ever making up the difference --
-    // confirmed live: pikopool's real balance drained from ~0.26 ICP to
-    // ~0.0097 ICP over just 3 real wins, well below the 0.2501 ICP a win
-    // costs, silently failing the next win attempt with IcpFeeFailed.
-    // This mirrors the PIKO reward side's own existing sweep-to-biggest-
-    // contributor mechanism (below), which already guarantees 100% of the
-    // REWARD gets distributed -- this does the same for the FEE side.
-    var feeNeeded = totalFeeE8s;
-    var shareWeight = payableTotal;
-    var i = 0;
-    for ((p, c) in entries.vals()) {
-      let isEligible = cohort.eligible[i];
-      i += 1;
-      let feeShare = if (not isEligible or shareWeight == 0) { 0 } else { feeNeeded * c / shareWeight };
-      let collected = if (not isEligible) { false } else if (feeShare == 0) { true } else {
-        let outcome = try {
-          ?(
-            await IcpLedger.icrc2_transfer_from({
-              spender_subaccount = null;
-              from = { owner = p; subaccount = null };
-              to = { owner = Principal.fromActor(self); subaccount = null };
-              amount = feeShare;
-              fee = null;
-              memo = null;
-              created_at_time = null;
-            })
-          );
-        } catch (_e) { null };
-        switch (outcome) {
-          case (? #Ok(_)) true;
-          case _ false;
-        };
+    for (payment in payments.vals()) {
+      let cut = reward * payment.shares / total;
+      distributed += cut;
+      let prevPending = switch (Map.get(pendingPoolRewards, Principal.compare, payment.participant)) {
+        case (?v) v;
+        case null 0;
       };
-      // Remove this participant's weight from the remaining payable pool
-      // (only meaningful for eligible entries -- shareWeight only ever
-      // counted payableTotal to begin with) so whoever's processed after
-      // them has their share of the STILL-needed fee recomputed against
-      // what's left. On success, feeNeeded also drops by what they just
-      // paid; on a same-pass failure despite passing pass 1, it's left
-      // untouched, so their unpaid portion becomes everyone-after-them's
-      // problem -- exactly mirroring how their own forfeited PIKO reward
-      // (below) already gets swept to the round's biggest paying
-      // contributor.
-      if (isEligible) { shareWeight -= c };
-      if (collected) {
-        feeNeeded -= feeShare;
-        let cut = reward * c / total;
-        distributed += cut;
-        let prevPending = switch (Map.get(pendingPoolRewards, Principal.compare, p)) {
-          case (?v) v;
-          case null 0;
-        };
-        Map.add(pendingPoolRewards, Principal.compare, p, prevPending + cut);
-        if (c > highestCount) { highestCount := c; highestPrincipal := ?p };
-      };
-      // else: didn't cover their share of the fee -- forfeits this
-      // round's PIKO too. Their share count for the round is simply
-      // dropped below when this round's entries are removed; nothing
-      // else to reverse, since nothing was credited to them.
+      Map.add(pendingPoolRewards, Principal.compare, payment.participant, prevPending + cut);
+      if (payment.shares > highestCount) { highestCount := payment.shares; highestPrincipal := ?payment.participant };
     };
-    // Integer-division dust (from whoever DID get paid) goes to the
-    // round's biggest paying contributor -- same remainder convention
-    // pikopoker uses for split pots.
     let remainder = Int.abs(reward - distributed);
     if (remainder > 0) {
       switch (highestPrincipal) {
@@ -419,16 +439,16 @@ actor self {
         case null {};
       };
     };
-    // Remove only this round's own snapshot -- NOT Map.clear, which would
-    // also wipe any new shares (or nonces) that arrived (for the next
-    // round) during this function's awaits above.
-    for ((p, _) in entries.vals()) {
-      Map.remove(currentRoundShares, Principal.compare, p);
-    };
-    for (n in usedNonceKeysThisRound.vals()) {
-      Map.remove(usedNoncesThisRound, Nat.compare, n);
-    };
+    // Only this round's snapshot: shares and nonces that arrived during the
+    // awaits belong to the next round.
+    for ((p, _) in entries.vals()) { Map.remove(currentRoundShares, Principal.compare, p) };
+    for (n in nonces.vals()) { Map.remove(usedNoncesThisRound, Nat.compare, n) };
   };
+
+  // Only one win at a time, or two winning shares would each collect the fee. A
+  // timestamp rather than a flag, so a trap mid-win cannot block wins forever.
+  transient var winStartedAt : Int = 0;
+  transient let WIN_GUARD_NANOS : Int = 300_000_000_000;
 
   public shared ({ caller }) func submitShare<system>(height : Nat, nonce : Nat) : async Types.ShareResult {
     if (Principal.isAnonymous(caller)) { return #Err(#Anonymous) };
@@ -476,49 +496,48 @@ actor self {
       return #Ok({ accepted = true; isBlockWinner = false; poolSubmitResult = null });
     };
 
-    // This share also solves the real block -- claim it under this
-    // canister's own principal, then split the reward across the round.
-    // Captured before the call (not read back off cachedWork afterwards):
-    // this is the fee mother is actually about to pull from THIS
-    // canister's own account right now, which is what participants need
-    // to collectively reimburse, regardless of what miningFeeE8s becomes
-    // by the time cachedWork next refreshes.
-    let feeE8sAtWin = cachedWork.miningFeeE8s;
+    // This share also solves the real block.
+    if (now - winStartedAt < WIN_GUARD_NANOS) {
+      return #Ok({ accepted = true; isBlockWinner = false; poolSubmitResult = null });
+    };
+    winStartedAt := now;
+
+    let entries = Iter.toArray(Map.entries(currentRoundShares));
+    let nonces = Iter.toArray(Map.keys(usedNoncesThisRound));
     // What this win costs the pool: mother's pull debits the fee plus one ledger
     // fee, and refreshing the allowance afterwards costs one more.
-    let roundCostE8s = feeE8sAtWin + 2 * ICP_LEDGER_FEE_E8S;
-    // Never advance a fee nobody can reimburse: that is how the reserve drained.
-    let roundEntries = Iter.toArray(Map.entries(currentRoundShares));
-    if ((await payingCohort(roundEntries, roundCostE8s)).weight == 0) {
+    let roundFee = await collectRoundFee(entries, cachedWork.miningFeeE8s + 2 * ICP_LEDGER_FEE_E8S);
+    if (not roundFee.fullyFunded) {
+      await refundRoundFee(roundFee.payments);
+      winStartedAt := 0;
       return #Ok({ accepted = true; isBlockWinner = true; poolSubmitResult = ?#Err(#IcpFeeFailed(#InsufficientAllowance({ allowance = 0 }))) });
     };
+
     let Mother : Types.MotherActor = actor (Principal.toText(motherId));
-    let result = await Mother.submitProof(nonce);
+    let result : Types.SubmitResult = try {
+      await Mother.submitProof(nonce);
+    } catch (_e) { #Err(#IcpFeeFailed(#TemporarilyUnavailable)) };
     switch (result) {
       case (#Ok(ok)) {
-        await distributeRoundReward(ok.reward, roundCostE8s);
+        creditRound(ok.reward, entries, nonces, roundFee.payments);
         blocksWon += 1;
         totalPikoDistributed += ok.reward;
-        // Top the mother allowance back up NOW, not only after a failure:
-        // each win consumes ~miningFee of the cap, so waiting for
-        // IcpFeeFailed means every Nth win is lost (seen 2026-09-20).
+        // Each win consumes the allowance, so renew it now rather than lose a
+        // later win to it (seen 2026-09-20).
         ignore refreshMotherApproval();
         ignore refreshCachedWork(); // don't wait for the next timer tick to see the new height
       };
-      case (#Err(#IcpFeeFailed(#InsufficientAllowance(_)))) {
-        // Self-heal so the next winning share has a fresh approval; this round's
-        // share credit is not lost either way. Any other cause is left alone,
-        // since approving costs a ledger fee and would not help.
-        ignore refreshMotherApproval();
+      case (#Err(e)) {
+        // Shares stay credited and carry over to the next win.
+        switch (e) {
+          case (#IcpFeeFailed(#InsufficientAllowance(_))) { ignore refreshMotherApproval() };
+          case (#StaleWork) { ignore refreshCachedWork() };
+          case _ {};
+        };
+        await refundRoundFee(roundFee.payments);
       };
-      case (#Err(#StaleWork)) {
-        // Someone else (another pool, a solo miner) won this height
-        // first. No one is penalized -- shares already credited this
-        // round carry over toward the next win.
-        ignore refreshCachedWork();
-      };
-      case (#Err(_)) {};
     };
+    winStartedAt := 0;
     #Ok({ accepted = true; isBlockWinner = true; poolSubmitResult = ?result });
   };
 

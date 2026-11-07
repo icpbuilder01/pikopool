@@ -6,7 +6,7 @@ Miners submit shares, meaning nonces that clear a lower difficulty than the netw
 
 - **Canister:** `feqm6-7aaaa-aaaap-quzsa-cai`
 - **Commission:** none. 100% of each block's PIKO reward goes to participants.
-- **Mining fee:** each participant pays their share of the block's ICP fee. To do that, they approve the pool once on the ICP ledger. A participant with no approval gets no reward for that round.
+- **Mining fee:** each participant pays their share of the block's ICP fee before the proof is submitted. To do that, they approve the pool once on the ICP ledger. A participant who cannot pay gets no reward for that round. If the proof then fails, the fee is refunded minus ledger fees.
 - **Client:** [PikoNativeMiner](https://github.com/icpbuilder01/pikonativeminer) has a pool mode.
 
 ## How it works

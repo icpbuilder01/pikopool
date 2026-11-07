@@ -106,8 +106,10 @@ type ApproveError =
    TooOld;
  };
 service : {
+  claimFeeRefund: () -> (TransferResult);
   claimPoolReward: () -> (TransferResult);
   heartbeat: () -> ();
+  getMyFeeRefund: () -> (nat) query;
   getMyShare: () -> (record {
                        pendingReward: nat;
                        sharesThisRound: nat;
