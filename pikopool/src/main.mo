@@ -84,10 +84,17 @@ actor self {
   // must stay easier than the real target, or they stop splitting the work
   // and valid winning hashes get rejected as below the share target.
   transient let MIN_SHARE_BITS_BELOW_NETWORK : Nat = 6;
+  // Every share is an update call this canister pays for, and a block takes
+  // 2^(network - share) shares on average. With the share target fixed, that
+  // count doubles with every bit the network climbs (about a million shares a
+  // block at 36 bits), which would drain the pool. So the share target also
+  // follows the network from below: at most 2^13 (~8k) shares a block.
+  transient let MAX_SHARE_BITS_BELOW_NETWORK : Nat = 13;
   func effectiveShareBits() : Nat {
     let network = cachedWork.difficultyBits;
     let ceiling = if (network > MIN_SHARE_BITS_BELOW_NETWORK) { network - MIN_SHARE_BITS_BELOW_NETWORK } else { 1 };
-    Nat.min(shareDifficultyBits, ceiling);
+    let floor = if (network > MAX_SHARE_BITS_BELOW_NETWORK) { network - MAX_SHARE_BITS_BELOW_NETWORK } else { 1 };
+    Nat.max(Nat.min(shareDifficultyBits, ceiling), floor);
   };
 
   public shared ({ caller }) func setShareDifficultyBits(bits : Nat) : async () {
@@ -241,7 +248,25 @@ actor self {
     false;
   };
 
+  // Both maps get one entry per principal that ever calls, and principals are
+  // free to make, so stale entries are dropped on every work tick. An entry
+  // older than these windows no longer changes any answer.
+  func pruneStaleMinerEntries() {
+    let now = Time.now();
+    let staleSeen = List.empty<Principal>();
+    for ((p, seenAt) in Map.entries(lastSeenAt)) {
+      if (now - seenAt >= ACTIVE_WINDOW_NANOS) { List.add(staleSeen, p) };
+    };
+    for (p in List.values(staleSeen)) { Map.remove(lastSeenAt, Principal.compare, p) };
+    let staleAttempts = List.empty<Principal>();
+    for ((p, at) in Map.entries(lastShareAttempt)) {
+      if (now - at >= MIN_SHARE_INTERVAL_NANOS) { List.add(staleAttempts, p) };
+    };
+    for (p in List.values(staleAttempts)) { Map.remove(lastShareAttempt, Principal.compare, p) };
+  };
+
   func onWorkTimer() : async () {
+    pruneStaleMinerEntries();
     if (anyMinerActive()) {
       await refreshCachedWork();
     } else {
