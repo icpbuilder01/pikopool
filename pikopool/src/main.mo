@@ -88,8 +88,9 @@ actor self {
   // 2^(network - share) shares on average. With the share target fixed, that
   // count doubles with every bit the network climbs (about a million shares a
   // block at 36 bits), which would drain the pool. So the share target also
-  // follows the network from below: at most 2^13 (~8k) shares a block.
-  transient let MAX_SHARE_BITS_BELOW_NETWORK : Nat = 13;
+  // follows the network from below: at most 2^10 (~1k) shares a block, about
+  // 10B cycles, well under what one block earns the family in cycles.
+  transient let MAX_SHARE_BITS_BELOW_NETWORK : Nat = 10;
   func effectiveShareBits() : Nat {
     let network = cachedWork.difficultyBits;
     let ceiling = if (network > MIN_SHARE_BITS_BELOW_NETWORK) { network - MIN_SHARE_BITS_BELOW_NETWORK } else { 1 };
@@ -222,31 +223,40 @@ actor self {
   transient let lastSeenAt : Map.Map<Principal, Int> = Map.empty<Principal, Int>();
   let ACTIVE_WINDOW_NANOS : Int = 60_000_000_000; // 60s -- comfortably above the client's own heartbeat interval
 
-  public shared ({ caller }) func heartbeat<system>() : async () {
+  // A heartbeat is free to send, so on its own it must not keep the work timer
+  // awake (one ping a minute cost ~360B cycles/day). It only shows the miner as
+  // present and, at most every few minutes, refreshes a job gone stale while
+  // the pool slept. Valid shares are what start the timer.
+  transient let IDLE_REFRESH_INTERVAL_NANOS : Int = 300_000_000_000;
+  transient var lastIdleRefreshAt : Int = 0;
+  transient var lastValidShareAt : Int = 0;
+
+  public shared ({ caller }) func heartbeat() : async () {
     if (Principal.isAnonymous(caller)) { return };
-    if (noteMinerActive<system>(caller)) { ignore refreshCachedWork() };
+    let now = Time.now();
+    Map.add(lastSeenAt, Principal.compare, caller, now);
+    if (workTimerId == null and now - lastIdleRefreshAt >= IDLE_REFRESH_INTERVAL_NANOS) {
+      lastIdleRefreshAt := now;
+      try { ignore refreshCachedWork() } catch (_e) {};
+    };
   };
 
   // Polling mother costs about 42M cycles per call, which every 10s came to
   // ~360B cycles/day whether or not anyone was mining. So the work timer only
-  // runs while a miner has been seen within ACTIVE_WINDOW_NANOS: it starts on
-  // the first heartbeat or share and stops itself once they all go quiet.
+  // runs while a valid share has arrived within ACTIVE_WINDOW_NANOS: it starts
+  // on the first one and stops itself once they stop coming.
   // Returns true when this woke the timer up: cachedWork may then be hours
   // old, so the caller should refresh it right away.
-  func noteMinerActive<system>(miner : Principal) : Bool {
-    Map.add(lastSeenAt, Principal.compare, miner, Time.now());
+  func noteValidShare<system>(miner : Principal) : Bool {
+    let now = Time.now();
+    Map.add(lastSeenAt, Principal.compare, miner, now);
+    lastValidShareAt := now;
     if (workTimerId != null) { return false };
     armWorkTimer<system>();
     true;
   };
 
-  func anyMinerActive() : Bool {
-    let now = Time.now();
-    for ((_, seenAt) in Map.entries(lastSeenAt)) {
-      if (now - seenAt < ACTIVE_WINDOW_NANOS) { return true };
-    };
-    false;
-  };
+  func anyMinerActive() : Bool { Time.now() - lastValidShareAt < ACTIVE_WINDOW_NANOS };
 
   // Both maps get one entry per principal that ever calls, and principals are
   // free to make, so stale entries are dropped on every work tick. An entry
@@ -334,11 +344,38 @@ actor self {
     if (spendable > ICP_LEDGER_FEE_E8S) { spendable - ICP_LEDGER_FEE_E8S } else { 0 };
   };
 
+  // Reads every participant at once rather than one after the other: each ICP
+  // ledger call is a cross-subnet round trip of a few seconds, and until the
+  // proof reaches mother another miner can take the block.
+  func readCapacities(entries : [(Principal, Nat)], capacities : [var Nat]) : async* () {
+    let IcpLedger : Types.LedgerActor = actor (Principal.toText(icpLedgerId));
+    let spender = { owner = Principal.fromActor(self); subaccount = null };
+    let allowanceCalls = List.empty<(Nat, async Types.Allowance)>();
+    let balanceCalls = List.empty<(Nat, async Nat)>();
+    for (i in Nat.range(0, entries.size())) {
+      let account = { owner = entries[i].0; subaccount = null };
+      try { List.add(allowanceCalls, (i, IcpLedger.icrc2_allowance({ account; spender }))) } catch (_e) {};
+      try { List.add(balanceCalls, (i, IcpLedger.icrc1_balance_of(account))) } catch (_e) {};
+    };
+    let allowances = VarArray.repeat<Nat>(0, entries.size());
+    let balances = VarArray.repeat<Nat>(0, entries.size());
+    for ((i, call) in List.values(allowanceCalls)) {
+      allowances[i] := try { (await call).allowance } catch (_e) { 0 };
+    };
+    for ((i, call) in List.values(balanceCalls)) {
+      balances[i] := try { await call } catch (_e) { 0 };
+    };
+    for (i in Nat.range(0, entries.size())) {
+      let spendable = Nat.min(allowances[i], balances[i]);
+      capacities[i] := if (spendable > ICP_LEDGER_FEE_E8S) { spendable - ICP_LEDGER_FEE_E8S } else { 0 };
+    };
+  };
+
   // Who can cover their share of the fee. Dropping a participant raises what
   // the others owe, so this repeats until everyone left can afford their share.
   func payingCohort(entries : [(Principal, Nat)], totalFeeE8s : Nat) : async* { eligible : [Bool]; weight : Nat } {
     let capacities = VarArray.repeat<Nat>(0, entries.size());
-    for (i in Nat.range(0, entries.size())) { capacities[i] := await* payingCapacity(entries[i].0) };
+    await* readCapacities(entries, capacities);
     let eligible = VarArray.repeat<Bool>(true, entries.size());
     var weight = 0;
     for ((_, c) in entries.vals()) { weight += c };
@@ -499,8 +536,13 @@ actor self {
       };
     };
     // Only this round's snapshot: shares and nonces that arrived during the
-    // awaits belong to the next round.
-    for ((p, _) in entries.vals()) { Map.remove(currentRoundShares, Principal.compare, p) };
+    // awaits belong to the next round, including those of its participants.
+    for ((p, counted) in entries.vals()) {
+      let now = switch (Map.get(currentRoundShares, Principal.compare, p)) { case (?c) c; case null 0 };
+      if (now > counted) { Map.add(currentRoundShares, Principal.compare, p, now - counted : Nat) } else {
+        Map.remove(currentRoundShares, Principal.compare, p);
+      };
+    };
     for (n in nonces.vals()) { Map.remove(usedNoncesThisRound, Nat.compare, n) };
   };
 
@@ -523,14 +565,13 @@ actor self {
       case null {};
     };
     Map.add(lastShareAttempt, Principal.compare, caller, now);
-    // Older clients send shares without heartbeats.
-    if (noteMinerActive<system>(caller)) { ignore refreshCachedWork() };
 
     if (height != cachedWork.height) { return #Err(#StaleWork) };
 
     let candidateHash = computeHash(cachedWork.previousHash, height, nonce);
     let zeroBits = leadingZeroBits(candidateHash);
     if (zeroBits < effectiveShareBits()) { return #Err(#BelowShareTarget) };
+    if (noteValidShare<system>(caller)) { try { ignore refreshCachedWork() } catch (_e) {} };
 
     // At most MAX_ROUND_PARTICIPANTS distinct participants per round: a win
     // makes ~3 sequential ICP ledger calls per participant, so an unbounded
@@ -555,6 +596,22 @@ actor self {
       return #Err(#DuplicateNonce);
     };
     Map.add(usedNoncesThisRound, Nat.compare, nonce, ());
+
+    // A newcomer must be able to pay a share of a block's fee. Otherwise a few
+    // free throwaway identities could take every seat of the round and lock
+    // real miners out. A share that wins the block outright is never refused.
+    if (not Map.containsKey(currentRoundShares, Principal.compare, caller) and zeroBits < cachedWork.difficultyBits) {
+      let capacity = await* payingCapacity(caller);
+      let stillRoom = Map.containsKey(currentRoundShares, Principal.compare, caller) or Map.size(currentRoundShares) < MAX_ROUND_PARTICIPANTS;
+      if (capacity < cachedWork.miningFeeE8s / MAX_ROUND_PARTICIPANTS or not stillRoom) {
+        Map.remove(usedNoncesThisRound, Nat.compare, nonce);
+        return #Err(#TooSoon({ retryAfterNanos = ROUND_FULL_RETRY_NANOS }));
+      };
+      if (height != cachedWork.height) {
+        Map.remove(usedNoncesThisRound, Nat.compare, nonce);
+        return #Err(#StaleWork);
+      };
+    };
 
     // Valid share -- credit it now, regardless of what happens below.
     let prevCount = switch (Map.get(currentRoundShares, Principal.compare, caller)) {
@@ -599,6 +656,9 @@ actor self {
         // later win to it (seen 2026-09-20).
         try { ignore refreshMotherApproval() } catch (_e) {};
         try { ignore refreshCachedWork() } catch (_e) {}; // don't wait for the next timer tick to see the new height
+        // Participants are credited above; if mother's mint to this canister
+        // failed, the reward waits in mother under this canister's name.
+        try { ignore claimRewardFromMother() } catch (_e) {};
       };
       case (#Err(e)) {
         // Shares stay credited and carry over to the next win.
@@ -607,11 +667,29 @@ actor self {
           case (#StaleWork) { try { ignore refreshCachedWork() } catch (_e) {} };
           case _ {};
         };
-        await* refundRoundFee(roundFee.payments);
+        // StaleWork: mother already kept the fee (another proof won the race
+        // while it was being pulled), so it is gone, as it would be for a solo
+        // miner. Refunding it would come out of the pool's own reserve.
+        if (e != #StaleWork) { await* refundRoundFee(roundFee.payments) };
       };
     };
     winStartedAt := 0;
     #Ok({ accepted = true; isBlockWinner = true; poolSubmitResult = ?result });
+  };
+
+  // Anyone may trigger it: it can only move PIKO from mother to this canister,
+  // to back rewards already credited to participants.
+  transient let MOTHER_CLAIM_MIN_INTERVAL_NANOS : Int = 60_000_000_000;
+  transient var lastMotherClaimAt : Int = 0;
+
+  public shared func claimRewardFromMother() : async Types.SubmitResult {
+    let now = Time.now();
+    if (now - lastMotherClaimAt < MOTHER_CLAIM_MIN_INTERVAL_NANOS) {
+      return #Err(#TooSoon({ retryAfterNanos = Int.abs(MOTHER_CLAIM_MIN_INTERVAL_NANOS - (now - lastMotherClaimAt)) }));
+    };
+    lastMotherClaimAt := now;
+    let Mother : Types.MotherActor = actor (Principal.toText(motherId));
+    await Mother.claimPendingReward();
   };
 
   // Same standard ICRC-1 fee the rest of the PIKO family already documents

@@ -108,6 +108,7 @@ type ApproveError =
 service : {
   claimFeeRefund: () -> (TransferResult);
   claimPoolReward: () -> (TransferResult);
+  claimRewardFromMother: () -> (SubmitResult);
   heartbeat: () -> ();
   getMyFeeRefund: () -> (nat) query;
   getMyShare: () -> (record {

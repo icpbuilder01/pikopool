@@ -121,6 +121,7 @@ module {
   public type MotherActor = actor {
     getWork : () -> async Work;
     submitProof : (Nat) -> async SubmitResult;
+    claimPendingReward : () -> async SubmitResult;
   };
 
   // Pool-specific result types.
