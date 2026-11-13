@@ -802,4 +802,70 @@ actor self {
 
   // Timers do not survive upgrades, and workTimerId resets with them, so the
   // next heartbeat or share simply starts the timer again.
+
+  // ---- Ingress filter (anti-spam) ----
+  //
+  // Runs before a user's call is accepted; a call refused here costs this
+  // canister no cycles. It is only an early "no": it runs on one node and
+  // canister callers skip it, so every method still does all of its own
+  // checks. Public methods are listed explicitly; anything else (admin
+  // methods, queries sent as paid update calls, timer-only maintenance) is
+  // left to controllers. Timers call their methods as self-calls, which never
+  // come through here.
+  transient let HEARTBEAT_MIN_INTERVAL_NANOS : Int = 15_000_000_000; // the miner sends one every 20 s
+
+  system func inspect({
+    caller : Principal;
+    arg : Blob;
+    msg : {
+      #setMotherId : Any;
+      #lockMotherId : Any;
+      #setPikoLedgerId : Any;
+      #lockPikoLedgerId : Any;
+      #setIcpLedgerId : Any;
+      #lockIcpLedgerId : Any;
+      #setShareDifficultyBits : Any;
+      #setApprovalCapE8s : Any;
+      #refreshMotherApproval : Any;
+      #heartbeat : Any;
+      #claimFeeRefund : Any;
+      #getMyFeeRefund : Any;
+      #submitShare : () -> (Nat, Nat);
+      #claimRewardFromMother : Any;
+      #claimPoolReward : Any;
+      #getPoolConfig : Any;
+      #getPoolStats : Any;
+      #getMyShare : Any;
+    };
+  }) : Bool {
+    if (arg.size() > 1024) { return false };
+    let now = Time.now();
+    switch msg {
+      case (#submitShare f) {
+        let (workHeight, nonce) = f();
+        not Principal.isAnonymous(caller) and workHeight == cachedWork.height
+        and not Map.containsKey(usedNoncesThisRound, Nat.compare, nonce)
+        and leadingZeroBits(computeHash(cachedWork.previousHash, workHeight, nonce)) >= effectiveShareBits();
+      };
+      // A miner's first heartbeats can be refused until its first share: the
+      // client ignores the answer and the share itself marks it as seen.
+      case (#heartbeat _) {
+        not Principal.isAnonymous(caller) and (
+          switch (Map.get(lastSeenAt, Principal.compare, caller)) {
+            case (?seen) { now - seen >= HEARTBEAT_MIN_INTERVAL_NANOS };
+            case null { workTimerId == null and now - lastIdleRefreshAt >= IDLE_REFRESH_INTERVAL_NANOS };
+          }
+        );
+      };
+      case (#claimFeeRefund _) { Map.containsKey(pendingFeeRefunds, Principal.compare, caller) };
+      case (#claimPoolReward _) {
+        switch (Map.get(pendingPoolRewards, Principal.compare, caller)) {
+          case (?owed) { owed > PIKO_LEDGER_FEE };
+          case null { false };
+        };
+      };
+      case (#claimRewardFromMother _) { now - lastMotherClaimAt >= MOTHER_CLAIM_MIN_INTERVAL_NANOS };
+      case _ { Principal.isController(caller) };
+    };
+  };
 };
