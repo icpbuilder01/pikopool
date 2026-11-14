@@ -13,6 +13,7 @@ import Map "mo:core/Map";
 import List "mo:core/List";
 import Iter "mo:core/Iter";
 import Sha256 "mo:sha2/Sha256";
+import Cycles "mo:core/Cycles";
 import Types "types";
 
 // PikoPool -- an on-chain, proportional-per-round mining pool for PIKO.
@@ -234,7 +235,12 @@ actor self {
   public shared ({ caller }) func heartbeat() : async () {
     if (Principal.isAnonymous(caller)) { return };
     let now = Time.now();
-    Map.add(lastSeenAt, Principal.compare, caller, now);
+    // Only this round's participants count as seen (see the anti-spam
+    // section); anyone else only gets the shared idle refresh below.
+    if (Map.containsKey(currentRoundShares, Principal.compare, caller) and spendWait(now) == null) {
+      takeSpend(now);
+      Map.add(lastSeenAt, Principal.compare, caller, now);
+    };
     if (workTimerId == null and now - lastIdleRefreshAt >= IDLE_REFRESH_INTERVAL_NANOS) {
       lastIdleRefreshAt := now;
       try { ignore refreshCachedWork() } catch (_e) {};
@@ -571,6 +577,21 @@ actor self {
     let candidateHash = computeHash(cachedWork.previousHash, height, nonce);
     let zeroBits = leadingZeroBits(candidateHash);
     if (zeroBits < effectiveShareBits()) { return #Err(#BelowShareTarget) };
+
+    // Paid entry and spend budget (see the anti-spam section). A share that
+    // clears the network target is a real block and always goes through.
+    let winning = zeroBits >= cachedWork.difficultyBits;
+    let newcomer = not Map.containsKey(currentRoundShares, Principal.compare, caller);
+    if (not winning) {
+      let roomForNewcomer = Map.size(currentRoundShares) < MAX_ROUND_PARTICIPANTS;
+      let refusal = if (newcomer and not roomForNewcomer) { null } else if (newcomer) { enterPaidRefusal(caller, now) } else {
+        switch (spendWait(now)) { case (?w) { ?w }; case null { takeSpend(now); null } };
+      };
+      switch (refusal) {
+        case (?wait) { return #Err(#TooSoon({ retryAfterNanos = wait })) };
+        case null {};
+      };
+    };
     if (noteValidShare<system>(caller)) { try { ignore refreshCachedWork() } catch (_e) {} };
 
     // At most MAX_ROUND_PARTICIPANTS distinct participants per round: a win
@@ -602,6 +623,7 @@ actor self {
     // real miners out. A share that wins the block outright is never refused.
     if (not Map.containsKey(currentRoundShares, Principal.compare, caller) and zeroBits < cachedWork.difficultyBits) {
       let capacity = await* payingCapacity(caller);
+      notePaidOutcome(caller, capacity >= cachedWork.miningFeeE8s / MAX_ROUND_PARTICIPANTS, Time.now());
       let stillRoom = Map.containsKey(currentRoundShares, Principal.compare, caller) or Map.size(currentRoundShares) < MAX_ROUND_PARTICIPANTS;
       if (capacity < cachedWork.miningFeeE8s / MAX_ROUND_PARTICIPANTS or not stillRoom) {
         Map.remove(usedNoncesThisRound, Nat.compare, nonce);
@@ -803,6 +825,99 @@ actor self {
   // Timers do not survive upgrades, and workTimerId resets with them, so the
   // next heartbeat or share simply starts the timer again.
 
+  // ---- Paid entries and spend budget (2026-11-14) ----
+  //
+  // Shares are cheap to make at a low network difficulty, and a newcomer's
+  // first share costs two ICP ledger calls (payingCapacity). Known
+  // participants (anyone ever admitted to a round) get 3 free failed
+  // admissions, then a wait of 10 s doubling to 1 h; one admission clears
+  // it. Everyone else shares a small allowance: 30 at once, one more every
+  // 2 min. Every accepted share and heartbeat also draws on a spend credit
+  // that refills at about 4% of this canister's balance per day (one hour's
+  // worth at most at once), so whatever gets past the other checks can
+  // drain at most about that, shrinking with the balance. A share that
+  // clears the network target (a real block) is never held back.
+  let knownParticipants : Map.Map<Principal, Bool> = Map.empty<Principal, Bool>();
+  func isKnownParticipant(p : Principal) : Bool { Map.containsKey(knownParticipants, Principal.compare, p) };
+
+  transient let NEWCOMER_BURST : Int = 30;
+  transient let NEWCOMER_REFILL_NANOS : Int = 120_000_000_000;
+  transient var newcomerCredit : Int = NEWCOMER_BURST * NEWCOMER_REFILL_NANOS;
+  transient var newcomerCreditAt : Int = 0;
+  transient let FREE_FAILURES : Nat = 3;
+  transient let FAILURE_BACKOFF_BASE_NANOS : Int = 10_000_000_000;
+  transient let FAILURE_BACKOFF_MAX_NANOS : Int = 3_600_000_000_000;
+  transient let failureStreaks : Map.Map<Principal, (Nat, Int)> = Map.empty<Principal, (Nat, Int)>();
+
+  transient let SPEND_BPS_PER_DAY : Nat = 400; // 4%: a pool share is cheap, and real mining sends many
+  transient let SPEND_COST : Int = 10_000_000;
+  transient let SPEND_BURST_SECONDS : Int = 3_600;
+  transient var spendCredit : Int = 0;
+  transient var spendCreditAt : Int = 0;
+  transient var spendStarted : Bool = false;
+
+  func spendRatePerSecond() : Int { Cycles.balance() * SPEND_BPS_PER_DAY / 10_000 / 86_400 };
+  func spendCreditNow(now : Int) : Int {
+    let rate = spendRatePerSecond();
+    let cap = rate * SPEND_BURST_SECONDS;
+    if (not spendStarted) { return cap };
+    Int.min(cap, spendCredit + (now - spendCreditAt) * rate / 1_000_000_000);
+  };
+  func spendWait(now : Int) : ?Nat {
+    let credit = spendCreditNow(now);
+    if (credit >= SPEND_COST) { return null };
+    ?Int.abs((SPEND_COST - credit) * 1_000_000_000 / Int.max(1, spendRatePerSecond()));
+  };
+  func takeSpend(now : Int) {
+    spendCredit := spendCreditNow(now) - SPEND_COST;
+    spendCreditAt := now;
+    spendStarted := true;
+  };
+
+  func newcomerCreditNow(now : Int) : Int {
+    Int.min(NEWCOMER_BURST * NEWCOMER_REFILL_NANOS, newcomerCredit + (now - newcomerCreditAt));
+  };
+
+  // null = admitted; ?n = refused, retry in about n nanoseconds.
+  func paidRefusal(caller : Principal, now : Int) : ?Nat {
+    if (isKnownParticipant(caller)) {
+      switch (Map.get(failureStreaks, Principal.compare, caller)) {
+        case (?(_, until)) { if (until > now) { return ?Int.abs(until - now) } };
+        case null {};
+      };
+    } else {
+      let credit = newcomerCreditNow(now);
+      if (credit < NEWCOMER_REFILL_NANOS) { return ?Int.abs(NEWCOMER_REFILL_NANOS - credit) };
+    };
+    spendWait(now);
+  };
+
+  func enterPaidRefusal(caller : Principal, now : Int) : ?Nat {
+    switch (paidRefusal(caller, now)) {
+      case (?wait) { return ?wait };
+      case null {};
+    };
+    if (not isKnownParticipant(caller)) {
+      newcomerCredit := newcomerCreditNow(now) - NEWCOMER_REFILL_NANOS;
+      newcomerCreditAt := now;
+    };
+    takeSpend(now);
+    null;
+  };
+
+  func notePaidOutcome(p : Principal, admitted : Bool, now : Int) {
+    if (admitted) {
+      Map.add(knownParticipants, Principal.compare, p, true);
+      Map.remove(failureStreaks, Principal.compare, p);
+    } else if (isKnownParticipant(p)) {
+      let streak = switch (Map.get(failureStreaks, Principal.compare, p)) { case (?(k, _)) { k + 1 }; case null { 1 } };
+      let wait = if (streak <= FREE_FAILURES) { 0 } else {
+        Int.min(FAILURE_BACKOFF_MAX_NANOS, FAILURE_BACKOFF_BASE_NANOS * (2 ** Nat.min(20, streak - FREE_FAILURES - 1 : Nat)));
+      };
+      Map.add(failureStreaks, Principal.compare, p, (streak, now + wait));
+    };
+  };
+
   // ---- Ingress filter (anti-spam) ----
   //
   // Runs before a user's call is accepted; a call refused here costs this
@@ -843,19 +958,24 @@ actor self {
     switch msg {
       case (#submitShare f) {
         let (workHeight, nonce) = f();
-        not Principal.isAnonymous(caller) and workHeight == cachedWork.height
-        and not Map.containsKey(usedNoncesThisRound, Nat.compare, nonce)
-        and leadingZeroBits(computeHash(cachedWork.previousHash, workHeight, nonce)) >= effectiveShareBits();
+        if (Principal.isAnonymous(caller) or workHeight != cachedWork.height or Map.containsKey(usedNoncesThisRound, Nat.compare, nonce)) { return false };
+        let bits = leadingZeroBits(computeHash(cachedWork.previousHash, workHeight, nonce));
+        if (bits < effectiveShareBits()) { return false };
+        if (bits >= cachedWork.difficultyBits) { return true }; // a real block always goes through
+        let intervalOk = switch (Map.get(lastShareAttempt, Principal.compare, caller)) { case (?t) { now - t >= MIN_SHARE_INTERVAL_NANOS }; case null { true } };
+        intervalOk and (if (Map.containsKey(currentRoundShares, Principal.compare, caller)) { spendWait(now) == null } else {
+          Map.size(currentRoundShares) < MAX_ROUND_PARTICIPANTS and paidRefusal(caller, now) == null;
+        });
       };
-      // A miner's first heartbeats can be refused until its first share: the
-      // client ignores the answer and the share itself marks it as seen.
+      // Counted only for this round's participants (one every 15 s); anyone
+      // else only gets the one shared idle refresh slot. The client ignores
+      // the answer, so a refused heartbeat changes nothing for it.
       case (#heartbeat _) {
-        not Principal.isAnonymous(caller) and (
-          switch (Map.get(lastSeenAt, Principal.compare, caller)) {
-            case (?seen) { now - seen >= HEARTBEAT_MIN_INTERVAL_NANOS };
-            case null { workTimerId == null and now - lastIdleRefreshAt >= IDLE_REFRESH_INTERVAL_NANOS };
-          }
+        if (Principal.isAnonymous(caller)) { return false };
+        let participantOk = Map.containsKey(currentRoundShares, Principal.compare, caller) and spendWait(now) == null and (
+          switch (Map.get(lastSeenAt, Principal.compare, caller)) { case (?seen) { now - seen >= HEARTBEAT_MIN_INTERVAL_NANOS }; case null { true } }
         );
+        participantOk or (workTimerId == null and now - lastIdleRefreshAt >= IDLE_REFRESH_INTERVAL_NANOS);
       };
       case (#claimFeeRefund _) { Map.containsKey(pendingFeeRefunds, Principal.compare, caller) };
       case (#claimPoolReward _) {
